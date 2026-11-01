@@ -277,6 +277,7 @@ function Adapter.new()
     gameCall(function()
         self.mapInfo = require(indexer.MapInfo)
         self.enemyInfo = require(indexer.EnemyInfo)
+        self.worldBossInfo = indexer:FindFirstChild("WorldBosses")and require(indexer.WorldBosses)or {}
         self.questsInfo = require(indexer.QuestsInfo)
         local bridges = require(self.rs.BridgeNet2)
         self.bridge = bridges.ReferenceBridge("ENEMY_EVENT")
@@ -292,9 +293,25 @@ function Adapter.new()
         self.damageFunctions = require(self.rs.SharedModules.DamageFunctions)
         self.shadowBridge = bridges.ReferenceBridge("PET_EVENT")
         self.cooldowns = require(self.rs.SharedModules.CooldownModule)
+        self.weapons = require(self.rs.SharedModules.WeaponsModule)
+        self.spinInfo = require(indexer.DailyRewards).Spin
+        self.infiniteInfo = require(indexer.InfiniteInfo)
+        self.infiniteBridge = bridges.ReferenceBridge("INFINITE_EVENT")
+        self.partyClient = require(self.rs.SharedModules.PartyClient)
+        self.waveRunClient = require(self.rs.SharedModules.WaveRunClient)
+        local scripts=self.player:FindFirstChild("PlayerScripts")
+        scripts=scripts and scripts:FindFirstChild("PlayerScripts")
+        local ui=scripts and scripts:FindFirstChild("NewUI")
+        local screens=ui and ui:FindFirstChild("Screens")
+        local party=screens and screens:FindFirstChild("Party")
+        local config=party and party:FindFirstChild("Config")
+        if config then self.partyInfo=require(config)end
         self.extras = require(self.rs.SharedModules.ExtraFunctions)
         self.pets = require(self.rs.SharedModules.PetsService)
         self.petController = require(self.rs.SharedModules.Pets.PetsController)
+        local enemiesModule=self.rs.SharedModules:FindFirstChild("Enemies")
+        local localModule=enemiesModule and enemiesModule:FindFirstChild("EnemyLocal")
+        if localModule then self.enemyLocal=require(localModule)end
     end)
     self.floorParams = RaycastParams.new()
     self.floorParams.FilterType = Enum.RaycastFilterType.Include
@@ -313,6 +330,89 @@ end
 
 function Adapter:getStats()return self.data:stats()end
 function Adapter:getSettings()return self.data:settings()end
+function Adapter:desertRoom()
+    return gameCall(function()return self.partyClient.GetRoom("InfiniteModeAction")end)
+end
+
+function Adapter.defaultCastleSpeeds()
+    return {Normal={request=1,value=1},Faster={request=2,value=4},Fastest={request=4,value=8},Insane={request=8,value=32}},
+        {"Normal","Faster","Fastest","Insane"}
+end
+function Adapter:speedCatalog(flag)
+    flag=flag or "IsCastle"
+    local now=os.clock()
+    self.speedCatalogs=self.speedCatalogs or {}
+    local cached=self.speedCatalogs[flag]
+    if cached and now<cached.nextRead then return cached.definitions,cached.names,cached.native end
+    local definitions,names=Adapter.defaultCastleSpeeds()
+    if flag=="InInfinite"then
+        definitions={Normal={request=1,value=1},Faster={request=2,value=3},Fastest={request=3,value=6}}
+        names={"Normal","Faster","Fastest"}
+    end
+    local nativeFound=false
+    local ok,native=pcall(function()
+        local ps=self.player:FindFirstChild("PlayerScripts")
+        local scripts=ps and ps:FindFirstChild("PlayerScripts")
+        local ui=scripts and scripts:FindFirstChild("NewUI")
+        local module=ui and ui:FindFirstChild("Dungeon")
+        if module and module:IsA("ModuleScript")then return gameCall(function()return require(module)end)end
+    end)
+    local read=debug and debug.getupvalues or getupvalues
+    if ok and type(native)=="table"and type(read)=="function"then
+        -- Read native speed definitions without running a UI action or parsing downloaded code.
+        local queue={{value=native,depth=0}}local seen={}local index,visited=1,0 local profile,labels
+        while index<=#queue and visited<350 and not(profile and labels)do
+            local item=queue[index]index+=1
+            local value,depth=item.value,item.depth
+            if not seen[value]then
+                visited+=1
+                seen[value]=true
+                if type(value)=="table"then
+                    if rawget(value,"Flag")==flag
+                        and type(rawget(value,"Speeds"))=="table"and type(rawget(value,"Values"))=="table"then profile=value end
+                    if rawget(value,1)=="Normal"and rawget(value,2)=="Faster"then labels=value end
+                end
+                if depth<7 and #queue<1500 then
+                    local children=value
+                    if type(value)=="function"then
+                        local success,upvalues=pcall(read,value)
+                        children=success and upvalues or nil
+                    end
+                    if type(children)=="table"then
+                        for key,child in pairs(children)do
+                            if #queue>=1500 then break end
+                            if key~="Controller"and(type(child)=="table"or type(child)=="function")then
+                                table.insert(queue,{value=child,depth=depth+1})
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        if profile then
+            local found,options={},{}
+            for i,request in ipairs(profile.Speeds)do
+                local expected=tonumber(profile.Values[i])
+                request=tonumber(request)
+                local label=labels and labels[i]or names[i]or("Speed "..i)
+                if type(label)=="string"and label~=""and request and expected
+                    and request>0 and request<math.huge and expected>0 and expected<math.huge and not found[label]then
+                    found[label]={request=request,value=expected}table.insert(options,label)
+                end
+            end
+            if #options>0 then definitions,names=found,options nativeFound=true end
+        end
+    end
+    self.speedCatalogs[flag]={definitions=definitions,names=names,native=nativeFound,nextRead=now+30}
+    return definitions,names,nativeFound
+end
+function Adapter:castleSpeedCatalog()
+    local definitions,names,native=self:speedCatalog("IsCastle")
+    self.castleSpeedNative=native return definitions,names
+end
+function Adapter:desertSpeedCatalog()
+    return self:speedCatalog("InInfinite")
+end
 
 function Adapter:hasShadowSpace()
     local stats=self:getStats()
@@ -368,14 +468,28 @@ function Adapter:refreshStats(now)
     end)
 end
 
-function Adapter:enemyAlive(enemy)
-    return enemy~=nil and enemy.Parent==self.enemies and enemy:IsA("BasePart")
-        and enemy:GetAttribute("Dead")~=true and Catalog.healthKey(enemy:GetAttribute("HP"))~=nil
+-- Instanced enemies retain their spawn attributes; live health and death are in EnemyLocal.
+function Adapter:enemyHP(enemy)
+    if self.enemyLocal then return self.enemyLocal.HP(enemy)end
+    return enemy:GetAttribute("HP")
 end
-
-function Adapter:isTarget(enemy, island, enemyId, catalogModule)
-    return enemy ~= nil and enemy.Parent == self.enemies and enemy:IsA("BasePart")
-        and catalogModule.matches(island, enemyId, enemy:GetAttributes())
+function Adapter:enemyAttributes(enemy)
+    local attrs=enemy:GetAttributes()
+    if self.enemyLocal then
+        attrs.HP=self.enemyLocal.HP(enemy)
+        attrs.Dead=self.enemyLocal.Dead(enemy)
+        if self.enemyLocal.Arised then attrs.Arised=self.enemyLocal.Arised(enemy)end
+    end
+    return attrs
+end
+function Adapter:enemyAlive(enemy)
+    if not enemy or enemy.Parent~=self.enemies or not enemy:IsA("BasePart")then return false end
+    local attrs=self:enemyAttributes(enemy)
+    return attrs.Dead~=true and Catalog.healthKey(attrs.HP)~=nil
+end
+function Adapter:isTarget(enemy,island,selected,catalogModule)
+    return enemy~=nil and enemy.Parent==self.enemies and enemy:IsA("BasePart")
+        and catalogModule.matches(island,selected,self:enemyAttributes(enemy))
 end
 
 function Adapter:nearest(island, enemyId, position, catalogModule)
@@ -393,7 +507,7 @@ function Adapter:highestHealth(island,selectedIds,position,catalogModule,current
     local best,bestHP,bestDistance=nil,nil,math.huge
     for _,enemy in ipairs(self.enemies:GetChildren())do
         if enemy:IsA("BasePart")then
-            local attrs=enemy:GetAttributes()
+            local attrs=self:enemyAttributes(enemy)
             if catalogModule.matches(island,selectedIds,attrs)and not(visited and visited[enemy])then
                 local hp=catalogModule.healthKey(attrs.HP)
                 local distance=(enemy.Position-position).Magnitude
@@ -470,7 +584,53 @@ function Adapter:spawnPosition(island, character, root, humanoid)
     return Vector3.new(spawn.Position.X, surfaceY + self:standingHeight(character, root, humanoid), spawn.Position.Z)
 end
 
+function Adapter:requestArea(position,key,now)
+    if typeof(position)~="Vector3"or not workspace.StreamingEnabled then return false end
+    now=now or os.clock()key=tostring(key)
+    self.areaRequests=self.areaRequests or {}
+    if self.areaBusy or now<(self.areaNext or 0)or now-(self.areaRequests[key]or -math.huge)<8 then return false end
+    local count=0 for _ in pairs(self.areaRequests)do count+=1 end
+    if count>=16 then self.areaRequests={}end
+    self.areaRequests[key]=now self.areaBusy=true self.areaNext=now+2
+    task.spawn(function()
+        pcall(function()self.player:RequestStreamAroundAsync(position,3)end)
+        self.areaBusy=false
+    end)
+    return true
+end
+
+-- Use the same input path as the game's AutoClick script; no operating-system mouse events.
+function Adapter:autoClickInput(now,lockedTarget)
+    if self.nativeClickBusy or now<(self.nextNativeClick or 0)then return end
+    if not self.weapons then return end
+    if lockedTarget then
+        local nearest=self.weapons.NearestEnemy()
+        if nearest~=lockedTarget then return end
+    end
+    self.nextNativeClick=now+.1 self.nativeClickBusy=true
+    task.spawn(function()
+        local ok,err=pcall(function()
+            gameCall(function()self.weapons.Click({KeyCode=Enum.KeyCode.ButtonX},false,nil,true)end)
+        end)
+        self.nativeClickBusy=false
+        if not ok and not self.nativeClickWarned then self.nativeClickWarned=true warn("[senzy hub] Auto click input: "..tostring(err))end
+    end)
+end
+
+-- Experimental request rate, independent of the native Punch cooldown. Server acceptance is authoritative.
+function Adapter:instanceClick(enemy,root,now)
+    if now<(self.nextInstanceClick or 0)then return false end
+    if not self:enemyAlive(enemy)or enemy:GetAttribute("Shield")==true then return false end
+    if(enemy.Position-root.Position).Magnitude>math.min(self.range,25)then return false end
+    self.nextInstanceClick=now+.15
+    -- Share the send budget with ordinary farm punches to avoid two packets on the same frame.
+    self.nextAttack=now+.15
+    self.bridge:Fire({Event="PunchAttack",Enemy=enemy.Name})
+    return true
+end
+
 function Adapter:attack(enemy, root, now)
+    if not self:enemyAlive(enemy)or enemy:GetAttribute("Shield")==true then return false end
     if now < (self.nextAttack or 0) then return false end
     if (enemy.Position - root.Position).Magnitude > math.min(self.range, 25) then return false end
     if not self.cooldowns.Verify("Punch", self.interval) then return false end
@@ -718,11 +878,11 @@ function Controller:updateStatus()
 end
 
 function Controller:setEnabled(enabled)
+    if enabled and self.desert then self.desert:stop("Farm selected")end
     self.visited={}self.armyWaitUntil=nil
     if enabled and self.castle then self.castle:stop("Farm selected")end
     if enabled and self.hunterTest then self.hunterTest:stop("Farm selected") end
     if enabled and self.mountHunt then self.mountHunt:setEnabled(false) end
-    if enabled and self.raid then self.raid:setEnabled(false) end
     self:invalidate()
     self.movement.corrections = 0
     self.enabled = enabled == true and self:selectionReady()
@@ -731,12 +891,12 @@ function Controller:setEnabled(enabled)
 end
 
 function Controller:setAutoSpawn(enabled)
+    if enabled and self.desert then self.desert:stop("Spawn setting selected")end
     self.autoSetSpawn=enabled==true
     self.spawnState=nil self:invalidate()
     if self.autoSetSpawn then
         if self.hunterTest then self.hunterTest:stop("Spawn setting selected")end
         if self.mountHunt then self.mountHunt:setEnabled(false)end
-        if self.raid then self.raid:setEnabled(false)end
         if self.dungeon then
             self.dungeon:setJoin(false)self.dungeon:setFarm(false)
             if self.dungeon.onStopped then self.dungeon.onStopped()end
@@ -796,6 +956,10 @@ function Controller:setMode(mode)
 end
 
 function Controller:stopAll(message)
+    if self.raid and self.raid.owns then self.raid:setEnabled(false)end
+    if self.desert and self.desert.owns then self.desert:stop(message)end
+    if self.storm and self.storm.owns then self.storm:setEnabled(false)end
+    if self.worldBoss and self.worldBoss.owns then self.worldBoss:setEnabled(false)end
     self.enabled, self.autoSetSpawn = false, false
     self:invalidate()
     self.status = message or "Stopped"
@@ -803,45 +967,84 @@ function Controller:stopAll(message)
 end
 
 function Controller:clickStep(now)
-    if self:isActive() or self.autoSetSpawn then
-        self.clickStatus="Paused while Farm is active"
-        return
+    if not self.alive or not self.clickEnabled then return end
+    if self.shadowFollow and self.shadowFollow:busy()then
+        self.clickStatus="Waiting for shadows"return
+    end
+    if self.autoSetSpawn and not self:isActive()then
+        self.clickStatus="Waiting for spawn travel"return
     end
     local adapter=self.adapter
     local blocked=adapter:blocked(true)
     if blocked then self.clickStatus=blocked return end
     local _,root=adapter:character()
-    if not root then self.clickStatus="Waiting for your character" return end
+    if not root then self.clickStatus="Waiting for your character"return end
     adapter:refreshStats(now)
+    if adapter.autoClickInput then
+        if not self:isActive()then adapter:autoClickInput(now)
+        elseif self.target and adapter:isTarget(self.target,self.island,self.selectedIds,self.catalogModule)then adapter:autoClickInput(now,self.target)end
+    end
     if now<(adapter.nextAttack or 0)then return end
     local best,bestDistance=nil,math.min(adapter.range,25)
-    for _,enemy in ipairs(adapter.enemies:GetChildren())do
-        if enemy:IsA("BasePart")then
-            local attrs=enemy:GetAttributes()
-            if attrs.Dead~=true and attrs.Shield~=true
-                and self.catalogModule.healthKey(attrs.HP)then
-                local distance=(enemy.Position-root.Position).Magnitude
-                if distance<=bestDistance then best,bestDistance=enemy,distance end
+    if self:isActive()then
+        -- Share the farm's locked target. Never choose another species or a corpse.
+        if adapter:isTarget(self.target,self.island,self.selectedIds,self.catalogModule)then
+            best=self.target
+        end
+        if not best then self.clickStatus="Waiting for farm target"return end
+        if(best.Position-root.Position).Magnitude>bestDistance then self.clickStatus="Moving to farm target"return end
+    else
+        for _,enemy in ipairs(adapter.enemies:GetChildren())do
+            if enemy:IsA("BasePart")then
+                local attrs=adapter:enemyAttributes(enemy)
+                if attrs.Dead~=true and attrs.Shield~=true and self.catalogModule.healthKey(attrs.HP)then
+                    local distance=(enemy.Position-root.Position).Magnitude
+                    if distance<=bestDistance then best,bestDistance=enemy,distance end
+                end
             end
         end
     end
-    if not best then self.clickStatus="No living enemy in attack range" return end
-    if adapter:attack(best,root,now)then
+    if not best then self.clickStatus="Auto clicking | Waiting for a nearby enemy"return end
+    if adapter:instanceClick(best,root,now)then
         self.clickCount+=1
-        self.clickStatus="Clicking nearby enemy | Hits: "..self.clickCount
-    else
-        self.clickStatus="Waiting for game attack cooldown"
+        self.clickStatus="Auto Click + Fast | Requests: "..self.clickCount
+    else self.clickStatus="Waiting for request interval"end
+end
+
+function Controller:eventStep(dt)
+    local workers={}
+    for _,name in ipairs({"raid","worldBoss","storm"})do if self[name]then table.insert(workers,self[name])end end
+    local function ready(worker)
+        if not worker or worker.alive==false then return false end
+        local ok,value=pcall(worker.wantsWork,worker)
+        if not ok then
+            worker:setEnabled(false)worker.status="Event stopped: "..tostring(value)
+            warn("[senzy hub] "..worker.status)return false
+        end
+        return value==true
     end
+    local owner=self.eventOwner
+    if owner and not ready(owner)then owner:release()self.eventOwner=nil owner=nil end
+    if not owner then
+        for _,worker in ipairs(workers)do
+            if ready(worker)then owner=worker self.eventOwner=worker break end
+        end
+    end
+    if not owner then return false end
+    local handled=owner:step(dt)
+    if not handled then owner:release()self.eventOwner=nil end
+    return handled==true
 end
 
 function Controller:step(dt)
     if not self.alive then return end
     if self.shadowFollow then self.shadowFollow:tick(os.clock())end
+    if self.desert and self.desert:step(dt)then return end
     if self.castle and self.castle:step(dt)then return end
     if self.hunterTest and self.hunterTest:step(dt) then return end
     if self.mountHunt and self.mountHunt:step(dt) then return end
-    if self.raid and self.raid:step(dt) then return end
     if self.dungeon and self.dungeon:step(dt) then return end
+    if self:eventStep(dt)then return end
     if self.clickEnabled then self:clickStep(os.clock()) end
     if not self:isActive() and not self.autoSetSpawn then return end
     local adapter = self.adapter
@@ -936,7 +1139,7 @@ function Controller:step(dt)
         self.status="Summoning shadows at target"return
     end
     if not target then self.status="Waiting for island monsters to load" return end
-    self.status = "Farming " .. targetName .. " | HP " .. tostring(target:GetAttribute("HP"))
+    self.status = "Farming " .. targetName .. " | HP " .. tostring(adapter:enemyHP(target))
     -- All operations below are non-yielding; never use a delayed task with an old target.
     if not self:isActive() or self.target ~= target
         or not adapter:isTarget(target,island,enemyId,self.catalogModule) then return end
@@ -967,7 +1170,7 @@ function Controller:start()
     end))
     task.spawn(function()
         while self.alive do
-            if self:isActive() or self.clickEnabled or (self.dungeon and self.dungeon:isFarming()) or (self.raid and self.raid.enabled) or (self.hunterTest and self.hunterTest.enabled) then
+            if self:isActive() or self.clickEnabled or (self.desert and self.desert.farmEnabled) or (self.storm and self.storm.enabled) or (self.worldBoss and self.worldBoss.enabled) or (self.dungeon and self.dungeon:isFarming()) or (self.raid and self.raid.enabled) or (self.hunterTest and self.hunterTest.enabled) then
                 local ok,err = pcall(self.adapter.refreshStats,self.adapter,os.clock())
                 if not ok then warn("[senzy hub] Combat stats: " .. tostring(err)) end
             end
@@ -979,8 +1182,12 @@ end
 function Controller:Destroy()
     if not self.alive then return end
     if self.config then self.config:Destroy()end
+    if self.wheel then self.wheel:Destroy()end
+    if self.desert then self.desert:Destroy()end
     self.alive,self.enabled,self.clickEnabled = false,false,false
     if self.shadowFollow then self.shadowFollow:Destroy()end
+    if self.storm then self.storm:Destroy()end
+    if self.worldBoss then self.worldBoss:Destroy()end
     if self.sell then self.sell:Destroy()end
     if self.castle then self.castle:Destroy()end
     if self.defeat then self.defeat:Destroy()end
@@ -993,7 +1200,10 @@ function Controller:Destroy()
     self:invalidate()
     for _,connection in ipairs(self.connections) do connection:Disconnect() end
     table.clear(self.connections)
-    if self.window then self.window:Unload() end
+    if self.window then
+        if type(setthreadidentity)=="function"then setthreadidentity(self.uiIdentity or 8)end
+        self.window:Unload()
+    end
     if getgenv().SenzyAriseFarm == self then getgenv().SenzyAriseFarm=nil end
 end
 
@@ -1015,14 +1225,6 @@ local INSTANCE_PLACES = {[128336380114944]=true,[73588121595735]=true}
 
 local function sameId(a,b)
     return a ~= nil and b ~= nil and tostring(a)==tostring(b)
-end
-local function gatePosition(gate)
-    if gate:IsA("BasePart")then return gate.Position end
-    if gate:IsA("Model")then return gate:GetPivot().Position end
-end
-local function isGate(gate)
-    return gate and gate.Name=="Dungeon"
-        and (gate:IsA("BasePart")or gate:IsA("Model"))
 end
 function Dungeon.rankSet(values,legacy)
     local set={}
@@ -1210,6 +1412,9 @@ end
 function Dungeon:setReplay(value)
     self.replayEnabled=value==true
     if self.replayEnabled then
+        if self.app.desert then self.app.desert:stop("Dungeon selected")end
+        if self.app.worldBoss then self.app.worldBoss:setEnabled(false)end
+        if self.app.storm then self.app.storm:setEnabled(false)end
         if self.app.hunterTest then self.app.hunterTest:stop("Dungeon selected")end
         if self.app.mountHunt then self.app.mountHunt:setEnabled(false)end
         if self.app.raid then self.app.raid:setEnabled(false)end
@@ -1232,7 +1437,7 @@ function Dungeon:unambiguousGate(gate)
     if not folder then return false end
     local want=gate:GetAttributes()
     for _,other in ipairs(folder:GetChildren())do
-        if other~=gate and isGate(other)then
+        if other~=gate and other.Name=="Dungeon"and other:IsA("BasePart")then
             local a=other:GetAttributes()
             if sameId(a.ID,want.ID)and(a.Dungeon~=want.Dungeon or a.DungeonRank~=want.DungeonRank
                 or a.IsRedDungeon~=want.IsRedDungeon)then return false end
@@ -1352,6 +1557,9 @@ function Dungeon:setFilter(key,value)
     self:save()
 end
 function Dungeon:setJoin(enabled)
+    if enabled and self.app.desert then self.app.desert:stop("Dungeon selected")end
+    if enabled and self.app.storm then self.app.storm:setEnabled(false)end
+    if enabled and self.app.worldBoss then self.app.worldBoss:setEnabled(false)end
     if enabled and self.app.castle then self.app.castle:stop("Dungeon selected")end
     if enabled and self.app.hunterTest then self.app.hunterTest:stop("Dungeon selected") end
     if enabled and self.app.mountHunt then self.app.mountHunt:setEnabled(false) end
@@ -1364,6 +1572,9 @@ function Dungeon:setJoin(enabled)
     self.status=self.joinEnabled and "Waiting for a matching dungeon" or "Auto Join stopped"
 end
 function Dungeon:setFarm(enabled)
+    if enabled and self.app.desert then self.app.desert:stop("Dungeon selected")end
+    if enabled and self.app.storm then self.app.storm:setEnabled(false)end
+    if enabled and self.app.worldBoss then self.app.worldBoss:setEnabled(false)end
     if enabled and self.app.castle then self.app.castle:stop("Dungeon selected")end
     if enabled and self.app.hunterTest then self.app.hunterTest:stop("Dungeon selected") end
     if enabled and self.app.mountHunt then self.app.mountHunt:setEnabled(false) end
@@ -1436,7 +1647,8 @@ function Dungeon:alreadyCleared(info)
     return world and world:GetAttribute(tostring(info.ID))==true
 end
 function Dungeon:gateMatches(gate)
-    if not isGate(gate) or gate.Parent~=self.adapter.main:FindFirstChild("__Dungeon") then return false end
+    if not gate or gate.Parent~=self.adapter.main:FindFirstChild("__Dungeon") or not gate:IsA("BasePart")
+        or gate.Name~="Dungeon" then return false end
     local info=gate:GetAttributes()
     return info.ID~=nil and tonumber(info.DungeonRank)~=nil and self.basic.Ranks[tonumber(info.DungeonRank)]~=nil
         and self.info[info.Dungeon]~=nil and Dungeon.matches(info,self.filters)
@@ -1458,8 +1670,7 @@ function Dungeon:chooseGate(root)
             if not cleared or self:canReplayGate(gate)then
                 if preferred and sameId(gate:GetAttribute("ID"),preferred)then return gate end
                 if self.joinEnabled then
-                    local position=gatePosition(gate)
-                    local d=position and (position-root.Position).Magnitude or math.huge
+                    local d=(gate.Position-root.Position).Magnitude
                     if d<distance then nearest,distance=gate,d end
                 end
             end
@@ -1561,9 +1772,7 @@ end
 
 function Dungeon:aliveEnemy(enemy)
     if not enemy or enemy.Parent~=self.adapter.enemies or not enemy:IsA("BasePart") then return false end
-    if enemy:GetAttribute("Dead")==true or enemy:GetAttribute("Shield")==true then return false end
-    local hp=tonumber(enemy:GetAttribute("HP"))
-    if not hp or hp<=0 then return false end
+    if not self.adapter:enemyAlive(enemy)or enemy:GetAttribute("Shield")==true then return false end
     local room=self.adapter.rs:GetAttribute("CurrentRoom")
     local enemyRoom=enemy:GetAttribute("Room") or enemy:GetAttribute("RoomId")
     return room==nil or enemyRoom==nil or sameId(room,enemyRoom)
@@ -1609,7 +1818,7 @@ function Dungeon:farmStep(character,root,humanoid,dt,now)
     if not arrived then self.status="Moving to a dungeon enemy"return true end
     if not self.farmEnabled or not self:inDungeon() or not self:aliveEnemy(target) then return true end
     if self.adapter:attack(target,root,now) then self.requests+=1 end
-    self.status="Room "..tostring(room or "?").." | HP "..tostring(target:GetAttribute("HP"))
+    self.status="Room "..tostring(room or "?").." | HP "..tostring(self.adapter:enemyHP(target))
     return true
 end
 function Dungeon:_step(dt)
@@ -1677,7 +1886,7 @@ function Dungeon:gateSummary()
     local gates={}
     if folder then
         for _,gate in ipairs(folder:GetChildren())do
-            if isGate(gate) and self:gateOpen(gate)then
+            if gate:IsA("BasePart") and gate.Name=="Dungeon" and self:gateOpen(gate)then
                 local info=gate:GetAttributes()
                 local key=info.Dungeon or info.MapName
                 if info.ID~=nil and key then
@@ -1774,6 +1983,36 @@ local Raid={}
 Raid.__index=Raid
 local ORDER={JJ1=1,JJ2=2,JJ3=3,JJ4=4}
 local WORLD1={[87039211657390]=true,[80896993021375]=true}
+function Raid.window(now,config)
+    config=config or {}
+    local interval=math.max(1,tonumber(config.OpenTime)or 1800)
+    local duration=math.clamp(tonumber(config.Duration)or 900,0,interval)
+    local offset=tonumber(config.Offset)or(interval-duration)
+    local phase=(now-offset)%interval
+    return phase<duration,phase<duration and duration-phase or interval-phase,math.floor((now-offset)/interval)
+end
+function Raid:serverNow()
+    return tonumber(self.adapter.rs:GetAttribute("DateTime"))or workspace:GetServerTimeNow()
+end
+function Raid:state()
+    local open,left,cycle=Raid.window(self:serverNow(),self.adapter.balanceInfo.JejuIsland)
+    if cycle~=self.windowCycle then
+        self.windowCycle=cycle self.streamRequested=false self.stateNext=0
+        table.clear(self.retired)table.clear(self.availabilityRetired)
+    end
+    local count=self.loadedCount or 0
+    if os.clock()>=(self.stateNext or 0)then
+        self.stateNext=os.clock()+.25 count=0
+        for _,enemy in ipairs(self.adapter.enemies:GetChildren())do
+            if enemy:IsA("BasePart")and not self.availabilityRetired[enemy]then
+                local attrs=self.adapter:enemyAttributes(enemy)
+                if Raid.isRaidInfo(attrs)and attrs.Dead~=true and Catalog.healthKey(attrs.HP)then count+=1 end
+            end
+        end
+        self.loadedCount=count
+    end
+    return self.finishedCycle~=cycle and(open or count>0),count,left,cycle
+end
 
 function Raid.isRaidInfo(info)
     return type(info)=="table" and ORDER[tostring(info.Id or info.ID)]~=nil
@@ -1787,10 +2026,12 @@ function Raid.new(app)
     local self=setmetatable({app=app,adapter=app.adapter,alive=true,enabled=false,
         mode="TP",speed=150,priorityMode="Wave Order",afterDefeat="Arise",
         returnAfter=true,status="Idle",records={},corpses={},retired={},
-        connections={},nextScan=0,nextLoot=0,kills=0,rounds=0,captured=0,destroyed=0},Raid)
+        connections={},nextScan=0,nextLoot=0,kills=0,rounds=0,captured=0,destroyed=0,eventName="Dedu Raid"},Raid)
     self.availabilityRetired={}
     table.insert(self.connections,self.adapter.bridge:Connect(function(message)
         if self.alive and type(message)=="table" and message.Event=="JejuFinish" then
+            local _,_,cycle=Raid.window(self:serverNow(),self.adapter.balanceInfo.JejuIsland)
+            self.finishedCycle=cycle
             self.raidStartedAt=nil
             for _,enemy in ipairs(self.adapter.enemies:GetChildren())do
                 if enemy:IsA("BasePart")and Raid.isRaidInfo(enemy:GetAttributes())then self.availabilityRetired[enemy]=true end
@@ -1806,6 +2047,7 @@ function Raid.new(app)
 end
 function Raid:release()
     if self.owns then self.app:invalidate()self.owns=false end
+    self:restoreLootControl()
 end
 function Raid:takeLootControl()
     if self.savedLootSettings then return end
@@ -1833,15 +2075,14 @@ function Raid:setEnabled(value)
     table.clear(self.corpses)table.clear(self.records)table.clear(self.retired)
     self.active=false self.returning=false self.finishAt=nil
     if value then
+        if self.app.desert then self.app.desert:stop("Raid selected")end
         if self.app.castle then self.app.castle:stop("Raid selected")end
         if self.app.hunterTest then self.app.hunterTest:stop("Raid selected")end
         if self.app.mountHunt then self.app.mountHunt:setEnabled(false)end
-        self.app:stopAll("Raid active")
         local d=self.app.dungeon
-        if d then d:setJoin(false)d:setFarm(false)if d.onStopped then d.onStopped()end end
+        if d then d:setJoin(false)d:setFarm(false)d:setReplay(false)if d.onStopped then d.onStopped()end end
         local _,root=self.adapter:character()
         self.returnPosition=root and root.Position or nil
-        if WORLD1[game.PlaceId]and self.adapter.rs:GetAttribute("Dungeon")~=true then self:takeLootControl()end
         self.app.movement.corrections=0
         self.status="Waiting for Dedu Raid"
     else
@@ -1853,13 +2094,14 @@ end
 function Raid:onEvent(message)
     local now=os.clock()
     if message.Event=="JejuFinish" then
+        local participated=self.active or self.owns
         if self.active then self.rounds+=1 end
         self.active=false self.target=nil self.finishAt=now
-        self.returning=self.returnAfter and self.returnPosition~=nil
+        self.returning=participated and self.returnAfter and self.returnPosition~=nil
         for _,enemy in ipairs(self.adapter.enemies:GetChildren())do
             if enemy:IsA("BasePart")and Raid.isRaidInfo(enemy:GetAttributes())then self.retired[enemy]=true end
         end
-        self.app.movement:stop()
+        if self.owns then self.app.movement:stop()end
         return
     end
     local key=tostring(message.Enemy or message.EnemyId or "")
@@ -1895,8 +2137,9 @@ function Raid:onEvent(message)
     end
 end
 function Raid:validEnemy(enemy)
+    if self.finishedCycle~=nil and self.finishedCycle==self.windowCycle then return false end
     if not enemy or enemy.Parent~=self.adapter.enemies or not enemy:IsA("BasePart")or self.retired[enemy]then return false end
-    local a=enemy:GetAttributes()
+    local a=self.adapter:enemyAttributes(enemy)
     return Raid.isRaidInfo(a)and a.Dead~=true and a.Shield~=true and (tonumber(a.HP)or 0)>0
 end
 function Raid:scan(root,now)
@@ -1928,10 +2171,17 @@ function Raid:scan(root,now)
 end
 function Raid:move(character,root,humanoid,goal,look,key,dt,now)
     if not goal then self.app.movement:stop()self.status="Waiting for ground"return false end
+    if self.app.shadowFollow then
+        local ready,reason=self.app.shadowFollow:beforeMove(key,character,root,goal,now)
+        if not ready then self.app.movement:stop()self.status=reason return false end
+    end
     local arrived,message=self.app.movement:step(character,root,humanoid,goal,look,self.mode,self.speed,key,dt,now)
     if message then
         if self.app.movement.corrections>=3 then self:setEnabled(false)end
         self.status=message return false
+    end
+    if arrived and self.app.shadowFollow and not self.app.shadowFollow:afterMove(true,now)then
+        self.status="Summoning shadows at Dedu"return false
     end
     return arrived
 end
@@ -1972,8 +2222,8 @@ function Raid:loot(character,root,humanoid,dt,now)
 end
 function Raid:_step(dt)
     if not self.enabled then self:release()return false end
-    if not self.owns then self.app:invalidate()self.owns=true end
-    if not WORLD1[game.PlaceId] or self.adapter.rs:GetAttribute("Dungeon")==true or self.adapter.rs:GetAttribute("HLRaid")==true then
+    if not WORLD1[game.PlaceId] or self.adapter.rs:GetAttribute("Dungeon")==true or self.adapter.rs:GetAttribute("HLRaid")==true
+        or self.adapter.rs:GetAttribute("IsCastle")==true or self.adapter.rs:GetAttribute("InInfinite")==true then
         self.app.movement:stop()self.status="Dedu Raid requires World 1"return true
     end
     local blocked=self.adapter:blocked()
@@ -1981,6 +2231,12 @@ function Raid:_step(dt)
     local character,root,humanoid=self.adapter:character()
     if not character then self.app.movement:stop()self.status="Waiting for character"return true end
     local now=os.clock()
+    local open,_,_,cycle=self:state()
+    if not open and not self.active and not self.returning and next(self.corpses)==nil then self:release()self.status="Waiting for Dedu Raid"return false end
+    if not self.owns then
+        self.app:invalidate()self.owns=true self.returnPosition=root.Position self:takeLootControl()
+    end
+    if not open and self.active then self:onEvent({Event="JejuFinish"})end
     if self.target and not self.adapter:enemyAlive(self.target)then
         self.target=nil self.app.movement:stop()self.app.movement:waitAfterEnemy(now)
     end
@@ -2000,7 +2256,7 @@ function Raid:_step(dt)
         end
         if not self.enabled or not self:validEnemy(target)then return true end
         local id=tostring(target:GetAttribute("Id")or target:GetAttribute("ID"))
-        self.status=(self.adapter.enemyInfo[id].Name or id).." | HP: "..tostring(target:GetAttribute("HP"))
+        self.status=(self.adapter.enemyInfo[id].Name or id).." | HP: "..tostring(self.adapter:enemyHP(target))
         self.adapter:attack(target,root,now)
         return true
     end
@@ -2013,9 +2269,31 @@ function Raid:_step(dt)
         end
         return true
     end
+    if open then
+        local goal=self.adapter:spawnPosition({key="JejuEvent"},character,root,humanoid)
+        if not goal then self.app.movement:stop()self.status="Dedu is open - island spawn is unavailable"return true end
+        if not self.streamRequested then
+            self.streamRequested=true
+            local player=self.adapter.player
+            task.spawn(function()pcall(function()player:RequestStreamAroundAsync(goal,3)end)end)
+        end
+        if(root.Position-goal).Magnitude>100 then
+            self.status="Dedu is open - moving to island"
+            self:move(character,root,humanoid,goal,goal,"DeduEntry:"..tostring(cycle),dt,now)
+        else self.app.movement:stop()self.status="Dedu is open - waiting for enemies to load"end
+        return true
+    end
     self.app.movement:stop()
     self.status=self.active and "Waiting for next wave"or "Waiting for Dedu Raid"
     return true
+end
+function Raid:wantsWork()
+    if not self.enabled or not WORLD1[game.PlaceId]or self.adapter:blocked()then return false end
+    local r=self.adapter.rs
+    if r:GetAttribute("Dungeon")==true or r:GetAttribute("IsCastle")==true or r:GetAttribute("InInfinite")==true
+        or r:GetAttribute("HLRaid")==true or not self.adapter:character()then return false end
+    local open=self:state()
+    return open or self.active==true or self.returning==true or next(self.corpses)~=nil
 end
 function Raid:step(dt)
     if not self.alive then return false end
@@ -2030,27 +2308,18 @@ function Raid:Destroy()
     table.clear(self.connections)table.clear(self.records)table.clear(self.corpses)table.clear(self.retired)
 end
 function Raid:availability()
-    if not WORLD1[game.PlaceId]or self.adapter.rs:GetAttribute("Dungeon")==true then return "Raid: Unavailable in this world" end
-    local now=os.clock()
-    local count=0
-    for enemy in pairs(self.availabilityRetired)do if not enemy.Parent then self.availabilityRetired[enemy]=nil end end
-    for _,enemy in ipairs(self.adapter.enemies:GetChildren())do
-        if enemy:IsA("BasePart")and not self.availabilityRetired[enemy]then
-            local a=enemy:GetAttributes()
-            if Raid.isRaidInfo(a)and a.Dead~=true and (tonumber(a.HP)or 0)>0 then count+=1 end
-        end
-    end
-    if count>0 then self.raidStartedAt=self.raidStartedAt or now end
-    local duration=tonumber(self.adapter.balanceInfo.JejuIsland and self.adapter.balanceInfo.JejuIsland.Duration)or 900
-    if self.raidStartedAt and now-self.raidStartedAt>duration and count==0 then self.raidStartedAt=nil end
-    if self.raidStartedAt then return "Raid: Active | Enemies: "..count end
-    return "Raid: Not started"
+    if not WORLD1[game.PlaceId]or self.adapter.rs:GetAttribute("Dungeon")==true
+        or self.adapter.rs:GetAttribute("IsCastle")==true or self.adapter.rs:GetAttribute("InInfinite")==true then return "Raid: Unavailable in this world" end
+    local open,count,left,cycle=self:state()
+    if open then return count>0 and "Raid: Active | Enemies: "..count or "Raid: Open | Enemies not loaded"end
+    if self.finishedCycle==cycle then return "Raid: Ended | Waiting for next round"end
+    return "Raid: Not started | Opens in "..math.ceil(left).."s"
 end
 function Raid:mount(group)
     local tab=group:Tab({Name="Raid"})
     self.tab=tab
     local farm=tab:Section({Name="Dudu Raid",Side="Left"})
-    local settings=tab:Section({Name="Settings",Side="Right"})
+    local settings=farm
     local availability=farm:Label({Text=self:availability()})
     local toggle,mode,priority,loot
     local function value(control,v)
@@ -2077,12 +2346,508 @@ function Raid:mount(group)
                 if current~=lastAvailability then lastAvailability=current pcall(availability.UpdateName,availability,current)end
             end
             local text=self.status.." | Kills: "..self.kills.." | Raids: "..self.rounds
+            if self.enabled and self.app.eventOwner and self.app.eventOwner~=self then text="Queued after "..self.app.eventOwner.eventName end
             if last~=text then last=text pcall(status.UpdateName,status,text)end
             task.wait(0.25)
         end
     end)
 end
 return Raid
+end)()
+
+local WorldBoss=(function()
+-- WorldBosses is the authoritative catalog; live enemies use EnemyLocal health.
+local WorldBoss={}
+WorldBoss.__index=WorldBoss
+function WorldBoss.windowAt(now,config)
+    config=config or {}
+    local interval=math.max(1,tonumber(config.OpenTime)or 1200)
+    local duration=math.clamp(tonumber(config.Duration)or 600,0,interval)
+    local phase=(now-(tonumber(config.Offset)or 0))%interval
+    return phase<duration,phase<duration and duration-phase or interval-phase,
+        math.floor((now-(tonumber(config.Offset)or 0))/interval)
+end
+function WorldBoss:window()
+    local stamp=self.adapter.rs:GetAttribute("DateTime")
+    local time=tonumber(stamp)or workspace:GetServerTimeNow()
+    local open,left,cycle=WorldBoss.windowAt(time,self.adapter.balanceInfo and self.adapter.balanceInfo.WorldBoss)
+    if self.checkCycle~=cycle then self.checkCycle=cycle self.checkedMaps={}self.defeated={}self.scout=nil end
+    return open and self.finishedCycle~=cycle,left,cycle
+end
+
+function WorldBoss.catalog(adapter)
+    local entries,byKey,byLabel={},{},{}
+    for _,boss in pairs(adapter.worldBossInfo or {})do
+        if type(boss)=="table"and type(boss.Boss)=="string"and type(boss.Map)=="string"then
+            local map,info=adapter.mapInfo[boss.Map],adapter.enemyInfo[boss.Boss]
+            local key=boss.Boss.."@"..boss.Map
+            if type(map)=="table"and type(info)=="table"and tonumber(map.World)==tonumber(adapter.world)
+                and not byKey[key]then
+                local entry={key=key,id=boss.Boss,map=boss.Map,mapId=tostring(map.Order),
+                    name=info.Name or boss.Boss,island=map.Name or boss.Map,order=tonumber(map.Order)or math.huge}
+                entry.label=entry.name.." | "..entry.island
+                byKey[key]=entry table.insert(entries,entry)
+            end
+        end
+    end
+    table.sort(entries,function(a,b)
+        if a.order~=b.order then return a.order<b.order end
+        if a.name~=b.name then return a.name<b.name end
+        return a.key<b.key
+    end)
+    for _,entry in ipairs(entries)do
+        if byLabel[entry.label]then entry.label=entry.label.." ["..entry.id.."]"end
+        byLabel[entry.label]=entry
+    end
+    return entries,byKey,byLabel
+end
+
+function WorldBoss.new(app)
+    local self=setmetatable({app=app,adapter=app.adapter,alive=true,enabled=false,
+        selected={},status="Select a World Boss",kills=0,nextScan=0,retired={},connections={},
+        checkedMaps={},defeated={},eventName="World Boss"},WorldBoss)
+    self.entries,self.byKey,self.byLabel=WorldBoss.catalog(self.adapter)
+    table.insert(self.connections,self.adapter.bridge:Connect(function(message)
+        if not self.alive or type(message)~="table"then return end
+        if message.Event=="WorldBossFinish"then
+            local _,_,cycle=self:window()self.finishedCycle=cycle self.scout=nil
+            for _,enemy in ipairs(self.adapter.enemies:GetChildren())do
+                if self:entryFor(enemy,false)then self.retired[enemy]=true end
+            end
+            self:release()self.status="World Boss ended - waiting for next spawn"
+        elseif message.Event=="RespawnEnemy"and type(message.Enemy)=="string"then
+            local enemy=self.adapter.enemies:FindFirstChild(message.Enemy)
+            if enemy then self.retired[enemy]=nil end
+            self.nextScan=0
+        end
+    end))
+    table.insert(self.connections,self.adapter.player.CharacterAdded:Connect(function()
+        self:release()self.nextScan=0 self.app.movement.corrections=0
+    end))
+    return self
+end
+
+function WorldBoss:entryFor(enemy,selectedOnly)
+    if not enemy or enemy.Parent~=self.adapter.enemies or not enemy:IsA("BasePart")then return end
+    local id,map=enemy:GetAttribute("Id"),tostring(enemy:GetAttribute("MapId"))
+    for _,entry in ipairs(self.entries)do
+        if id==entry.id and map==entry.mapId and(not selectedOnly or self.selected[entry.key])then return entry end
+    end
+end
+function WorldBoss:valid(enemy)
+    return self:entryFor(enemy,true)~=nil and not self.retired[enemy]
+        and self.adapter:enemyAlive(enemy)and enemy:GetAttribute("Shield")~=true
+end
+function WorldBoss:release()
+    self.target=nil self.nextScan=0 self.scout=nil
+    if self.owns then self.owns=false self.app:invalidate()end
+end
+function WorldBoss:select(labels)
+    self:release()self.selected={}self.scout=nil self.checkedMaps={}self.defeated={}
+    for _,label in ipairs(type(labels)=="table"and labels or {})do
+        local entry=self.byLabel[label]
+        if entry then self.selected[entry.key]=true end
+    end
+    if next(self.selected)==nil then self:setEnabled(false)self.status="Select a World Boss"end
+end
+function WorldBoss:setEnabled(value)
+    value=value==true and next(self.selected)~=nil
+    if value==self.enabled then self:sync()return self.enabled end
+    self:release()self.enabled=value
+    if value then
+        if self.app.desert then self.app.desert:stop("World Boss selected")end
+        if self.app.castle then self.app.castle:stop("World Boss selected")end
+        if self.app.hunterTest then self.app.hunterTest:stop("World Boss selected")end
+        if self.app.mountHunt then self.app.mountHunt:setEnabled(false)end
+        local d=self.app.dungeon
+        if d then d:setJoin(false)d:setFarm(false)d:setReplay(false)if d.onStopped then d.onStopped()end end
+        self.app.movement.corrections=0 self.status="Waiting for selected World Bosses"
+    else self.status="Stopped"end
+    self:sync()return self.enabled
+end
+function WorldBoss:nextIsland(character,root,humanoid,now)
+    if type(self.adapter.spawnPosition)~="function"then return end
+    local best,distance,seen=nil,math.huge,{}
+    for _,entry in ipairs(self.entries)do
+        if self.selected[entry.key]and not self.defeated[entry.key]and not seen[entry.map]
+            and now>=(self.checkedMaps[entry.map]or 0)then
+            seen[entry.map]=true
+            local goal=self.adapter:spawnPosition({key=entry.map},character,root,humanoid)
+            if goal then
+                local d=(root.Position-goal).Magnitude
+                if d<distance then best,distance={map=entry.map,island=entry.island,goal=goal},d end
+            end
+        end
+    end
+    return best
+end
+function WorldBoss:wantsWork()
+    if not self.enabled or next(self.selected)==nil or self.adapter:blocked()then return false end
+    local character,root,humanoid=self.adapter:character()
+    if not character then return false end
+    self:window()
+    if self:valid(self.target)then return true end
+    if self.target then return true end
+    self:scan(root,os.clock())
+    if self.target then return true end
+    local open=self:window()
+    return open and(self.scout~=nil or self:nextIsland(character,root,humanoid,os.clock())~=nil)or false
+end
+function WorldBoss:claim()
+    if self.owns then return end
+    if self.app.storm then self.app.storm:release()end
+    self.app:invalidate()self.owns=true
+end
+function WorldBoss:move(character,root,humanoid,goal,look,key,dt,now)
+    local app=self.app
+    if app.shadowFollow then
+        local ready,reason=app.shadowFollow:beforeMove(key,character,root,goal,now)
+        if not ready then app.movement:stop()self.status=reason return false end
+    end
+    local arrived,message=app.movement:step(character,root,humanoid,goal,look,"TP",app.speed,key,dt,now)
+    if message then
+        if app.movement.corrections>=3 then self:setEnabled(false)end
+        self.status=message return false
+    end
+    if arrived and app.shadowFollow and not app.shadowFollow:afterMove(true,now)then
+        self.status="Summoning shadows at World Boss"return false
+    end
+    return arrived
+end
+function WorldBoss:scoutStep(character,root,humanoid,dt,now)
+    local open=self:window()
+    if not open then self.scout=nil return false end
+    local scout=self.scout or self:nextIsland(character,root,humanoid,now)
+    if not scout then return false end
+    self.scout=scout self:claim()
+    if self.adapter.requestArea then self.adapter:requestArea(scout.goal,"Boss:"..scout.map,now)end
+    self.status="Checking World Boss | "..scout.island
+    local key="BossScout:"..self.checkCycle..":"..scout.map
+    if not self:move(character,root,humanoid,scout.goal,scout.goal,key,dt,now)then return true end
+    scout.arrivedAt=scout.arrivedAt or now
+    self.status="Loading World Boss | "..scout.island
+    if now-scout.arrivedAt>=5 then
+        self.checkedMaps[scout.map]=now+30 self.scout=nil
+    end
+    return true
+end
+function WorldBoss:sync()
+    local c=self.Controls and self.Controls.Enabled
+    self.syncing=true
+    if c and c:GetState()~=self.enabled then c:UpdateState(self.enabled)end
+    self.syncing=false
+end
+function WorldBoss:scan(root,now)
+    if now<self.nextScan then return end
+    self.nextScan=now+.25
+    for enemy in pairs(self.retired)do if not enemy.Parent then self.retired[enemy]=nil end end
+    local best,distance=nil,math.huge
+    for _,enemy in ipairs(self.adapter.enemies:GetChildren())do
+        if self:valid(enemy)then
+            local current=(root.Position-enemy.Position).Magnitude
+            if current<distance then best,distance=enemy,current end
+        end
+    end
+    self.target=best
+end
+function WorldBoss:_step(dt)
+    if not self.enabled then return false end
+    local adapter,app=self.adapter,self.app
+    local blocked=adapter:blocked()
+    if blocked then self:release()self.status=blocked return false end
+    local character,root,humanoid=adapter:character()
+    if not character then self:release()self.status="Waiting for your character"return false end
+    local now=os.clock()
+    self:window()
+    if self.target and not self:valid(self.target)then
+        if self.target.Parent==adapter.enemies and not adapter:enemyAlive(self.target)then
+            self.kills+=1 local entry=self:entryFor(self.target,true)
+            if entry then self.defeated[entry.key]=true end
+        end
+        self:release()app.movement:waitAfterEnemy(now)
+    end
+    if not self.target and not app.movement:waitingForEnemy(now)then self:scan(root,now)end
+    local target=self.target
+    if not target then
+        if app.movement:waitingForEnemy(now)then return self.owns==true end
+        if self:scoutStep(character,root,humanoid,dt,now)then return true end
+        if self.owns then self:release()end
+        self.status="Waiting for selected World Bosses"
+        -- The ordinary farm keeps running until a selected boss actually spawns.
+        return false
+    end
+    self.scout=nil self:claim()
+    if not self:valid(target)then return true end
+    local entry=self:entryFor(target,true)
+    local goal=adapter:targetPosition(target,character,root,humanoid,now)
+    if not goal then self.status="Waiting for boss position"return true end
+    self.status="Moving to "..entry.name.." | "..entry.island
+    if adapter.requestArea then adapter:requestArea(goal,"Boss:"..entry.map,now)end
+    if not self:move(character,root,humanoid,goal,target.Position,target,dt,now)then return true end
+    if not self.enabled or not self:valid(target)then return true end
+    self.status="Fighting "..entry.name.." | HP: "..tostring(adapter:enemyHP(target))
+    if app.clickEnabled then
+        adapter:autoClickInput(now,target)adapter:instanceClick(target,root,now)
+    else adapter:attack(target,root,now)end
+    return true
+end
+function WorldBoss:step(dt)
+    if not self.alive then return false end
+    local ok,result=pcall(self._step,self,dt)
+    if not ok then
+        self:setEnabled(false)self.status="World Boss stopped: "..tostring(result)
+        warn("[senzy hub] "..self.status)return false
+    end
+    return result
+end
+function WorldBoss:availability()
+    local names,seen={},{}
+    for _,enemy in ipairs(self.adapter.enemies:GetChildren())do
+        local entry=self:entryFor(enemy,next(self.selected)~=nil)
+        if entry and not self.retired[enemy]and self.adapter:enemyAlive(enemy)and not seen[entry.key]then
+            seen[entry.key]=true table.insert(names,entry.name.." | "..entry.island)
+        end
+    end
+    table.sort(names)
+    if #names>0 then return "Spawned: "..table.concat(names,", ")end
+    local open,left=self:window()
+    return open and "Boss round: Open | Checking selected islands"or "Boss: Next round in "..math.ceil(left).."s"
+end
+function WorldBoss:mount(tab)
+    local section=tab:Section({Name="World Boss",Side="Right"})
+    local options={}for _,entry in ipairs(self.entries)do table.insert(options,entry.label)end
+    local dropdown,toggle
+    dropdown=section:Dropdown({Name="World Boss",Options=options,Required=false,Search=true,Multi=true,
+        Callback=function()
+            if not self.alive or not dropdown then return end
+            local labels={}for label,active in pairs(dropdown:GetOptions())do if active then table.insert(labels,label)end end
+            self:select(labels)
+        end},"SenzyWorldBossSelect")
+    toggle=section:Toggle({Name="Auto Farm World Boss",Default=false,Callback=function(value)
+        if not self.alive or self.syncing or(toggle and toggle:GetState()~=(value==true))then return end
+        self:setEnabled(value)
+    end},"SenzyWorldBossFarm")
+    local availability=section:Label({Text=self:availability()})
+    local status=section:Label({Text=self.status})
+    self.Controls={Boss=dropdown,Enabled=toggle}
+    task.spawn(function()
+        local last,lastAvailability
+        while self.alive and self.app.alive do
+            local current=self:availability()
+            if current~=lastAvailability then lastAvailability=current pcall(availability.UpdateName,availability,current)end
+            local text=self.status.." | Defeated: "..self.kills
+            if self.enabled and self.app.eventOwner and self.app.eventOwner~=self then text="Queued after "..self.app.eventOwner.eventName end
+            if text~=last then last=text pcall(status.UpdateName,status,text)end
+            task.wait(.5)
+        end
+    end)
+end
+function WorldBoss:Destroy()
+    if not self.alive then return end
+    self.alive=false self.enabled=false self:release()
+    for _,c in ipairs(self.connections)do c:Disconnect()end
+    table.clear(self.connections)
+end
+return WorldBoss
+end)()
+
+local Storm=(function()
+-- Follow the replicated StormLocation. Do not predict an event from a local timer.
+local Storm={}
+Storm.__index=Storm
+local MODES={"All Monsters","Normal Only","Brutes Only"}
+
+function Storm.resolve(location,catalog)
+    if type(location)~="string"and type(location)~="number"then return end
+    local key=tostring(location)
+    return catalog.byKey[key]or catalog.byMapId[key]or catalog.byName[key]
+end
+function Storm.new(app)
+    local self=setmetatable({app=app,adapter=app.adapter,alive=true,enabled=false,mode="All Monsters",
+        visited={},nextSearch=0,kills=0,status="Stopped",connections={},eventName="Storm"},Storm)
+    table.insert(self.connections,self.adapter.rs:GetAttributeChangedSignal("StormLocation"):Connect(function()
+        if not self.alive then return end
+        self:release()self.island=nil self.visited={}
+    end))
+    table.insert(self.connections,self.adapter.player.CharacterAdded:Connect(function()
+        self:release()self.app.movement.corrections=0
+    end))
+    return self
+end
+function Storm:location()
+    local raw=self.adapter.rs:GetAttribute("StormLocation")
+    return Storm.resolve(raw,self.app.catalog),raw
+end
+function Storm:release()
+    self.target=nil self.nextSearch=0
+    if self.owns then self.owns=false self.app:invalidate()end
+end
+function Storm:sync()
+    local c=self.Controls and self.Controls.Enabled
+    self.syncing=true
+    if c and c:GetState()~=self.enabled then c:UpdateState(self.enabled)end
+    self.syncing=false
+end
+function Storm:setMode(mode)
+    local valid=false for _,value in ipairs(MODES)do if mode==value then valid=true break end end
+    if not valid or mode==self.mode then return end
+    self:release()self.mode=mode self.island=nil self.visited={}
+end
+function Storm:setEnabled(value)
+    value=value==true
+    if value==self.enabled then self:sync()return end
+    self:release()self.enabled=value self.island=nil self.visited={}
+    if value then
+        if self.app.desert then self.app.desert:stop("Storm selected")end
+        if self.app.castle then self.app.castle:stop("Storm selected")end
+        if self.app.hunterTest then self.app.hunterTest:stop("Storm selected")end
+        if self.app.mountHunt then self.app.mountHunt:setEnabled(false)end
+        local d=self.app.dungeon
+        if d then d:setJoin(false)d:setFarm(false)d:setReplay(false)if d.onStopped then d.onStopped()end end
+        self.app.movement.corrections=0 self.status="Waiting for Storm"
+    else self.status="Stopped"end
+    self:sync()
+end
+function Storm:buildTargets(island)
+    local ids={}
+    for _,m in ipairs(island.monsters)do
+        local info=self.adapter.enemyInfo[m.id]
+        local brute=info and info.TypeG=="BrutesDefeated"
+        if self.mode=="All Monsters"or self.mode=="Brutes Only"and brute
+            or self.mode=="Normal Only"and not brute then ids[m.id]=true end
+    end
+    self.ids=ids
+end
+function Storm:valid(enemy)
+    return self.adapter:isTarget(enemy,self.island,self.ids,self.app.catalogModule)
+end
+function Storm:wantsWork()
+    if not self.enabled or self.adapter:blocked()then return false end
+    local island=self:location()
+    return island~=nil and self.adapter:character()~=nil
+end
+function Storm:move(character,root,humanoid,goal,look,key,dt,now)
+    local app=self.app
+    if not goal then self.status="Waiting for island position"return false end
+    if app.shadowFollow then
+        local ready,reason=app.shadowFollow:beforeMove(key,character,root,goal,now)
+        if not ready then app.movement:stop()self.status=reason return false end
+    end
+    local arrived,message=app.movement:step(character,root,humanoid,goal,look,"TP",app.speed,key,dt,now)
+    if message then
+        if app.movement.corrections>=3 then self:setEnabled(false)end
+        self.status=message return false
+    end
+    if not arrived then self.status="Moving to Storm | "..self.island.name return false end
+    if app.shadowFollow and not app.shadowFollow:afterMove(true,now)then
+        self.status="Summoning shadows at Storm"return false
+    end
+    return true
+end
+function Storm:_step(dt)
+    if not self.enabled then return false end
+    local app,adapter=self.app,self.adapter
+    local island,raw=self:location()
+    if not island then
+        self:release()self.island=nil self.visited={}
+        self.status=(raw==nil or raw==false or raw=="")and "Waiting for Storm"or "Storm location is unavailable in this world"
+        return false
+    end
+    local blocked=adapter:blocked()
+    if blocked then self:release()self.status=blocked return false end
+    local character,root,humanoid=adapter:character()
+    if not character then self:release()self.status="Waiting for your character"return false end
+    if island~=self.island then
+        self:release()self.island=island self.visited={}self:buildTargets(island)
+    end
+    if next(self.ids)==nil then self:release()self.status="No matching monsters on "..island.name return false end
+    if not self.owns then app:invalidate()self.owns=true end
+    local now=os.clock()
+    if self.target and not self:valid(self.target)then
+        if not adapter:enemyAlive(self.target)then
+            if self.target.Parent==adapter.enemies then self.visited[self.target]=true self.kills+=1 end
+            app.movement:waitAfterEnemy(now)
+        end
+        self.target=nil app:invalidate()
+    end
+    if not self.target and app.movement:waitingForEnemy(now)then
+        app.movement:stop()self.status="Waiting after target death"return true
+    end
+    if not self.target and now>=self.nextSearch then
+        self.nextSearch=now+.2
+        for enemy in pairs(self.visited)do if not enemy.Parent then self.visited[enemy]=nil end end
+        local best=adapter:randomTarget(island,self.ids,app.catalogModule,self.visited)
+        if not best and next(self.visited)then
+            self.visited={}best=adapter:randomTarget(island,self.ids,app.catalogModule)
+        end
+        self.target=best
+        if best then app.movement:stop()end
+    end
+    local target=self.target
+    if not target then
+        local spawn=adapter:spawnPosition(island,character,root,humanoid)
+        if spawn and adapter.requestArea then adapter:requestArea(spawn,"Storm:"..island.key,now)end
+        if spawn and(root.Position-spawn).Magnitude>120 then
+            self:move(character,root,humanoid,spawn,spawn,"Storm:"..island.key,dt,now)
+        else app.movement:stop()self.status="Waiting for Storm monsters | "..island.name end
+        return true
+    end
+    local goal=adapter:targetPosition(target,character,root,humanoid,now)
+    if not self:move(character,root,humanoid,goal,target.Position,target,dt,now)then return true end
+    -- Check the current replicated location again immediately before sending a hit.
+    if not self.enabled or self:location()~=island or not self:valid(target)then return true end
+    local info=adapter.enemyInfo[target:GetAttribute("Id")]
+    self.status="Farming "..(info and info.Name or "Storm monster").." | "..island.name
+    if app.clickEnabled then
+        adapter:autoClickInput(now,target)adapter:instanceClick(target,root,now)
+    else adapter:attack(target,root,now)end
+    return true
+end
+function Storm:step(dt)
+    if not self.alive then return false end
+    local ok,result=pcall(self._step,self,dt)
+    if not ok then
+        self:setEnabled(false)self.status="Storm stopped: "..tostring(result)
+        warn("[senzy hub] "..self.status)return false
+    end
+    return result
+end
+function Storm:mount(tab)
+    local section=tab:Section({Name="Storm",Side="Right"})
+    local event=section:Label({Text="Storm: Inactive"})
+    local mode,toggle
+    mode=section:Dropdown({Name="Targets",Options=MODES,Default="All Monsters",Required=true,
+        Callback=function()
+            if not self.alive or not mode then return end
+            for value,active in pairs(mode:GetOptions())do if active then self:setMode(value)break end end
+        end},"SenzyStormTargets")
+    toggle=section:Toggle({Name="Auto Storm",Default=false,Callback=function(value)
+        if not self.alive or self.syncing or(toggle and toggle:GetState()~=(value==true))then return end
+        self:setEnabled(value)
+    end},"SenzyAutoStorm")
+    local status=section:Label({Text=self.status})
+    self.Controls={Mode=mode,Enabled=toggle}
+    task.spawn(function()
+        local last,lastEvent
+        while self.alive and self.app.alive do
+            local island,raw=self:location()
+            local active=raw~=nil and raw~=false and raw~=""
+            local current=island and "Storm: "..island.name or active and "Storm: Other world / unknown location"or "Storm: Inactive"
+            if current~=lastEvent then lastEvent=current pcall(event.UpdateName,event,current)end
+            local text=self.status.." | Defeated: "..self.kills
+            if self.enabled and self.app.eventOwner and self.app.eventOwner~=self then text="Queued after "..self.app.eventOwner.eventName end
+            if text~=last then last=text pcall(status.UpdateName,status,text)end
+            task.wait(.5)
+        end
+    end)
+end
+function Storm:Destroy()
+    if not self.alive then return end
+    self.alive=false self.enabled=false self:release()
+    for _,c in ipairs(self.connections)do c:Disconnect()end
+    table.clear(self.connections)
+end
+return Storm
 end)()
 
 local MountHunt=(function()
@@ -2115,7 +2880,9 @@ function MountHunt.new(app)
     end))
     for _,obj in ipairs(workspace:GetDescendants())do add(obj)end
     self:refreshRoute()
-    local inv=self.adapter:getStats():FindFirstChild("Inventory"):FindFirstChild("Mounts")
+    local stats=self.adapter:getStats()
+    local inventory=stats and stats:FindFirstChild("Inventory")
+    local inv=inventory and inventory:FindFirstChild("Mounts")
     if inv then table.insert(self.connections,inv.ChildAdded:Connect(function(item)
         local pending=self.pendingCapture
         if not self.enabled or not pending or os.clock()-pending.at>8 then return end
@@ -2179,6 +2946,9 @@ function MountHunt:setEnabled(value)
     self.generation=(self.generation or 0)+1
     self:release()self.enabled=value self.target=nil self.nextSearch=0 self.dwellUntil=nil self.pendingCapture=nil
     if value then
+        if self.app.desert then self.app.desert:stop("Mount hunt selected")end
+        if self.app.worldBoss then self.app.worldBoss:setEnabled(false)end
+        if self.app.storm then self.app.storm:setEnabled(false)end
         if self.app.castle then self.app.castle:stop("Mount hunt selected")end
         if self.app.hunterTest then self.app.hunterTest:stop("Mount hunt selected")end
         self.app:stopAll("Mount hunt active")
@@ -2461,6 +3231,7 @@ function HunterTest:stop(message)
     self:save()self:syncToggle()
 end
 function HunterTest:start()
+    if self.app.desert then self.app.desert:stop("Hunter Test selected")end
     if not self.alive or self.enabled then return end
     if not WORLDS[game.PlaceId]or self.adapter.rs:GetAttribute("Dungeon")==true then self.status="Return to the main world"return end
     if self.adapter.player:GetAttribute("InDungeon")==true then self.status="Leave the existing dungeon party first"return end
@@ -2468,6 +3239,8 @@ function HunterTest:start()
     if not ok then self.status=reason return end
     if self.app.castle then self.app.castle:stop("Hunter Test selected")end
     self.app:stopAll("Hunter Test active")
+    if self.app.worldBoss then self.app.worldBoss:setEnabled(false)end
+    if self.app.storm then self.app.storm:setEnabled(false)end
     if self.app.mountHunt then self.app.mountHunt:setEnabled(false)end
     if self.app.raid then self.app.raid:setEnabled(false)end
     local d=self.app.dungeon
@@ -2749,12 +3522,22 @@ function Server.normalize(value)
         if not params.privateserverlinkcode or not params.privateserverlinkcode:match("^[%w_%-]+$")then
             return nil,"Private server link code missing"
         end
-    elseif route=="/share"or route=="/share/"then
+    elseif route=="/share"or route=="/share/"or route=="/share-links"or route=="/share-links/"then
         if not params.code or not params.code:match("^[%w_%-]+$")or not params.type or params.type:lower()~="server"then
             return nil,"Use a server invitation share link"
         end
     else return nil,"Unsupported Roblox server link"end
     return "https://www.roblox.com"..path
+end
+function Server.launchUrl(value)
+    local url,reason=Server.normalize(value)
+    if not url then return nil,reason end
+    local path=url:match("^https://www%.roblox%.com(.*)$")
+    local route,query=path:match("^([^?]+)%?(.*)$")
+    local params={}for key,val in query:gmatch("([^&=?]+)=([^&#]*)")do params[key:lower()]=val end
+    local place=route:match("^/games/(%d+)")
+    if place then return "roblox://placeId="..place.."&linkCode="..params.privateserverlinkcode,url end
+    return "roblox://navigation/share_links?code="..params.code.."&type=Server",url
 end
 function Server.new(app)
     local self=setmetatable({app=app,alive=true,link="",status="",nextOpen=0},Server)
@@ -2774,6 +3557,27 @@ function Server:save()
         if not isfolder("SenzyAriseFarm")then makefolder("SenzyAriseFarm")end
         writefile(SETTINGS,game:GetService("HttpService"):JSONEncode({version=1,link=self.link}))
     end)
+end
+function Server:currentLink()
+    if self.Controls and self.Controls.Link then
+        local ok,value=pcall(self.Controls.Link.GetInput,self.Controls.Link)
+        if ok and type(value)=="string"then return value end
+    end
+    return self.link
+end
+function Server:openForReturn()
+    local launch,url=Server.launchUrl(self:currentLink())
+    if not launch then self:setStatus(url)return false end
+    self.link=url self:save()
+    -- Opening a URL is a launch request, not proof that Roblox joined the destination.
+    local opener=self.directOpener or openurl
+    if type(opener)=="function"then
+        local ok,result=pcall(opener,launch)
+        if ok and result~=false then self:setStatus("Private server launch requested")return true,"direct"end
+    end
+    local opened=(self.opener or Server.openLink)(url)
+    if opened then self:setStatus("Server link opened - Roblox may require Join / Play")return true,"browser"end
+    self:setStatus("Unable to open server link - returning to main world")return false
 end
 function Server.openLink(url)
     if type(openurl)=="function"then
@@ -2848,7 +3652,7 @@ function Defeat.new(app)
     return self
 end
 function Defeat:raidOwnsLoot()
-    return self.app.raid and self.app.raid.enabled==true
+    return self.app.raid and self.app.raid.enabled==true and self.app.raid.owns==true
 end
 function Defeat:releaseNative()
     local saved=self.native self.native=nil
@@ -2970,8 +3774,24 @@ local Castle=(function()
 -- Infernal only. Native CastleAction and acknowledged AFK floor progression.
 local Castle={}
 Castle.__index=Castle
-local SPEEDS={Normal=1,Faster=2,Fastest=4}
-local SPEED_VALUES={Normal=1,Faster=4,Fastest=8}
+function Castle:speeds()
+    if self.adapter.castleSpeedCatalog then return self.adapter:castleSpeedCatalog()end
+    return Adapter.defaultCastleSpeeds()
+end
+function Castle:speedStep(now)
+    if not self:inside()or not self.farmEnabled then return end
+    local definitions=self:speeds()
+    local desired=definitions[self.speed]
+    if not desired then return end
+    if self.speedRequest~=desired.request or self.speedJob~=game.JobId then
+        self.speedRequest=desired.request self.speedJob=game.JobId self.speedAttempts=0 self.nextSpeed=0
+    end
+    if tonumber(self.adapter.rs:GetAttribute("InfernalSpeed"))==desired.value then self.speedAttempts=0 return end
+    if now>=(self.nextSpeed or 0)and(self.speedAttempts or 0)<3 then
+        self.nextSpeed=now+5 self.speedAttempts=(self.speedAttempts or 0)+1
+        self.adapter.generalBridge:Fire({Event="CastleAction",Action="SpeedUp",Speed=desired.request})
+    end
+end
 function Castle.schedule(now)
     local phase=now%1800
     local open=phase>=900 and phase<1620
@@ -2992,7 +3812,7 @@ end
 function Castle.new(app,saved)
     saved=type(saved)=="table"and saved or {}
     local self=setmetatable({app=app,adapter=app.adapter,alive=true,joinEnabled=false,farmEnabled=false,replayEnabled=false,
-        floorChoice="First Floor",stopFloor=1000,speed="Normal",currency="Ticket",status="Idle",stage="waiting",
+        floorChoice="First Floor",stopFloor=1000,leaveAtStop=true,speed="Normal",currency="Ticket",status="Idle",stage="waiting",
         connections={},nextAction=0,native=saved.native,payment=saved.payment,blockedCycle=saved.blockedCycle},Castle)
     self.info=self.adapter.castleInfo
     self.combat=setmetatable({app=app,adapter=self.adapter,farmEnabled=true,requests=0,
@@ -3031,10 +3851,13 @@ function Castle:release()
     self.combat:release()self.combat.target=nil
 end
 function Castle:activate()
+    if self.app.desert then self.app.desert:stop("Infernal Castle selected")end
     if self.app.hunterTest then self.app.hunterTest:stop("Infernal Castle selected")end
     if self.app.mountHunt then self.app.mountHunt:setEnabled(false)end
     if self.app.raid then self.app.raid:setEnabled(false)end
     self.app:stopAll("Infernal Castle selected")
+    if self.app.worldBoss then self.app.worldBoss:setEnabled(false)end
+    if self.app.storm then self.app.storm:setEnabled(false)end
     self.app.dungeon:stop("Infernal Castle selected")
     self.adapter=self.app.adapter self.app.movement.corrections=0
 end
@@ -3053,6 +3876,7 @@ end
 function Castle:stop(reason)
     self.joinEnabled,self.farmEnabled,self.replayEnabled=false,false,false self.stage="waiting"
     self.status=reason or "Stopped"self:release()self:sync()
+    self.returnToPrivate=false self.privateAttempted=false self.privateWaitUntil=nil self.stoppedFloor=nil
 end
 function Castle:prepareResume()
     if self.app.config then self.app.config:flush()end
@@ -3074,16 +3898,17 @@ function Castle:prepareResume()
 ]],game.GameId,path)
     local ok=pcall(queue,code)if ok then getgenv().__SenzyCastleQueue=true end
 end
-function Castle:nativeStep(now,active)
+function Castle:nativeStep(now,active,hold)
     local settings=self.adapter:getSettings()if not settings then return false end
-    if active and not self.native then
+    if (active or hold)and not self.native then
         self.native={AfkCastle={value=settings:GetAttribute("AfkCastle")==true},AfksSettings={value=settings:GetAttribute("AfksSettings")==true}}
     end
     if not self.native then return true end
     local ready=true local complete=true
     self.settingsNext=self.settingsNext or {}self.settingAttempts=self.settingAttempts or {}
     for key,original in pairs(self.native)do
-        local desired=active or original.value
+        local desired
+        if hold then desired=false elseif active then desired=true else desired=original.value end
         if settings:GetAttribute(key)~=desired then
             ready=false complete=false
             local tag=key..tostring(desired)
@@ -3093,16 +3918,44 @@ function Castle:nativeStep(now,active)
             end
         end
     end
-    if not active and complete then self.native=nil self.settingAttempts={}self.settingsNext={}end
+    if not active and not hold and complete then self.native=nil self.settingAttempts={}self.settingsNext={}end
     return ready
 end
-function Castle:returnMain(now,reason)
-    self.stage="returning"self:release()self:nativeStep(now,false)
+function Castle:returnMain(now,reason,preferPrivate)
+    if preferPrivate~=nil then
+        self.returnToPrivate=preferPrivate==true
+        if not self.returnToPrivate then self.privateWaitUntil=nil end
+    end
+    self.stage="returning"self:release()self:nativeStep(now,false,true)
     self.status=reason or "Returning to main world"
+    if self.returnToPrivate and not self.privateAttempted then
+        self.privateAttempted=true
+        local server=self.app.server
+        local link=server and server:currentLink()
+        if type(link)=="string"and link:match("%S")then
+            self:prepareResume()
+            local opened,mode=server:openForReturn()
+            if opened then self.privateWaitUntil=now+30 self.privateReturnMode=mode end
+        end
+    end
+    if self.privateWaitUntil and now<self.privateWaitUntil then
+        self.status=self.privateReturnMode=="direct"and "Joining saved private server"or "Server link opened - waiting for Roblox Join / Play"
+        return true
+    elseif self.privateWaitUntil then
+        self.privateWaitUntil=nil self.returnToPrivate=false
+        self.status="Private server join not confirmed - returning to main world"
+    end
     if now<(self.nextReturn or 0)then return true end
     if(self.returnAttempts or 0)>=3 then self:stop("Return not confirmed")return true end
     self.returnAttempts=(self.returnAttempts or 0)+1 self.nextReturn=now+10
     self:prepareResume()self.adapter.generalBridge:Fire({Event="LeaveDungeon"})return true
+end
+function Castle:finishAtStop(now,floor)
+    self.stoppedFloor=floor self.blockedCycle=self:cycle()
+    self:release()self:nativeStep(now,false,true)
+    if self.leaveAtStop then return self:returnMain(now,"Stop floor cleared - returning",true)end
+    self.stage="holding"self.status="Stopped at floor "..tostring(floor or self.stopFloor)
+    return true
 end
 function Castle:joinStep(now)
     local open,left=Castle.schedule(self:now())
@@ -3141,7 +3994,10 @@ function Castle:_step(dt,now)
     local inside=self:inside()
     if not inside then
         self:nativeStep(now,false)
-        if self.wasInside then self.wasInside=false self:release()self.stage="waiting"self.nextAction=now+5 self.timeLeft=nil end
+        if self.wasInside then
+            self.wasInside=false self:release()self.stage="waiting"self.nextAction=now+5 self.timeLeft=nil
+            self.returnToPrivate=false self.privateAttempted=false self.privateWaitUntil=nil self.stoppedFloor=nil
+        end
         self.returnAttempts=0 self.nextReturn=nil
         if self.joinEnabled then return self:joinStep(now)end
         return false
@@ -3153,19 +4009,28 @@ function Castle:_step(dt,now)
     end
     if self.stage=="returning"then return self:returnMain(now)end
     local floor=tonumber(self.adapter.rs:GetAttribute("CurrentRoom"))
+    if self.stage=="holding"then
+        if self.leaveAtStop then return self:finishAtStop(now,floor)end
+        if floor and floor<self.stopFloor then self.stage="running"self.stoppedFloor=nil self.lastProgress=now
+        else self:nativeStep(now,false,true)return true end
+    end
     if floor~=self.lastFloor then self.lastFloor=floor self.seen=false self.emptySince=nil self.combat.target=nil self.lastProgress=now end
-    if floor and floor>self.stopFloor then return self:returnMain(now,"Target floor cleared - returning")end
+    if floor and floor>self.stopFloor then return self:finishAtStop(now,floor)end
     if self.timeLeft and self.timeLeft<=0 then self.blockedCycle=self:cycle()return self:returnMain(now,"Castle timer ended - returning")end
-    local alive=0
+    local alive=0 local observed=false
     for _,enemy in ipairs(self.adapter.enemies:GetChildren())do
         local room=enemy:GetAttribute("Room")or enemy:GetAttribute("RoomId")
-        if self.adapter:enemyAlive(enemy)and(room==nil or tostring(room)==tostring(floor))then alive+=1 end
+        if room==nil or tostring(room)==tostring(floor)then
+            observed=true
+            if self.adapter:enemyAlive(enemy)then alive+=1 end
+        end
     end
+    if observed then self.seen=true end
     if alive>0 then self.seen=true self.emptySince=nil
     elseif self.seen then self.emptySince=self.emptySince or now end
     if floor and floor>=self.stopFloor then
-        self:nativeStep(now,false)
-        if self.emptySince and now-self.emptySince>=3 then return self:returnMain(now,"Target floor cleared - returning")end
+        self:nativeStep(now,false,true)
+        if self.emptySince and now-self.emptySince>=3 then return self:finishAtStop(now,floor)end
     else self:nativeStep(now,true)end
     local character,root,humanoid=self.adapter:character()
     if not character then self:release()self.status="Waiting for character"return true end
@@ -3174,7 +4039,7 @@ function Castle:_step(dt,now)
         self.combat.farmEnabled=true self.combat.timeLeft=self.timeLeft
         self.combat:farmStep(character,root,humanoid,dt,now)
         local target=self.combat.target
-        local hp=target and tostring(target:GetAttribute("HP"))
+        local hp=target and tostring(self.adapter:enemyHP(target))
         if target~=self.progressTarget or hp~=self.progressHP then
             self.progressTarget,self.progressHP=target,hp self.lastProgress=now
         end
@@ -3182,11 +4047,7 @@ function Castle:_step(dt,now)
         if self.app.movement.corrections>=3 then self:stop("Movement was reset repeatedly")end
     else self:release()self.status="Floor "..tostring(floor or "?").." | Waiting for native next floor"end
     if now-(self.lastProgress or now)>180 then self.blockedCycle=self:cycle()return self:returnMain(now,"Floor stalled - returning")end
-    local desired=SPEEDS[self.speed]
-    if desired and tonumber(self.adapter.rs:GetAttribute("InfernalSpeed"))~=SPEED_VALUES[self.speed] and now>=(self.nextSpeed or 0)and(self.speedAttempts or 0)<3 then
-        self.nextSpeed=now+5 self.speedAttempts=(self.speedAttempts or 0)+1
-        self.adapter.generalBridge:Fire({Event="CastleAction",Action="SpeedUp",Speed=desired})
-    end
+    self:speedStep(now)
     return true
 end
 function Castle:step(dt)
@@ -3196,8 +4057,8 @@ function Castle:step(dt)
     return result
 end
 function Castle:mount(tab)
-    local section=tab:Section({Name="Infernal Castle",Side="Left"})
-    local settings=tab:Section({Name="Castle Settings",Side="Right"})
+    local section=tab:Section({Name="Infernal Castle",Side="Right"})
+    local settings=section
     self.availability=section:Label({Text=""})self.floorLabel=section:Label({Text=""})
     local join,farm,replay,start,speed,currency
     join=section:Toggle({Name="Auto Join Infernal Castle",Default=false,Callback=function(v)if not self.syncing then self:setFlag("joinEnabled",v)end end},"SenzyCastleJoin")
@@ -3206,14 +4067,31 @@ function Castle:mount(tab)
     local function chosen(control)for value,active in pairs(control:GetOptions())do if active then return value end end end
     start=settings:Dropdown({Name="Start Floor",Options=Castle.checkpoints(self:maximum()),Default="First Floor",Required=true,Callback=function()if start then self.floorChoice=chosen(start)or "First Floor"end end},"SenzyCastleStart")
     local limit=settings:Slider({Name="Stop At Floor",Minimum=1,Maximum=1000,Default=1000,Precision=0,Callback=function(v)self.stopFloor=math.clamp(math.floor(tonumber(v)or 1000),1,1000)end},"SenzyCastleStop")
-    speed=settings:Dropdown({Name="Castle Speed",Options={"Normal","Faster","Fastest"},Default="Normal",Required=true,Callback=function()if speed then self.speed=chosen(speed)or "Normal"self.speedAttempts=0 end end},"SenzyCastleSpeed")
+    local leave=settings:Toggle({Name="Leave At Stop Floor",Default=true,Callback=function(value)self.leaveAtStop=value==true end},"SenzyCastleLeaveAtStop")
+    local _,speedNames=self:speeds()
+    speed=settings:Dropdown({Name="Castle Speed",Options=speedNames,Default=speedNames[1],Required=true,Callback=function()
+        if speed and not self.updatingSpeeds then
+            local definitions=self:speeds()local name=chosen(speed)
+            if definitions[name]then self.speed=name self.speedAttempts=0 self.nextSpeed=0 end
+        end
+    end},"SenzyCastleSpeed")
     currency=settings:Dropdown({Name="Replay Currency",Options={"Tickets","Gems"},Default="Tickets",Required=true,Callback=function()if currency then self.currency=chosen(currency)=="Gems"and "Gems"or "Ticket"end end},"SenzyCastleCurrency")
-    section:Button({Name="Return To Main World",Callback=function()if self:inside()then self:returnMain(os.clock(),"Returning to main world")end end})
+    section:Button({Name="Return To Main World",Callback=function()if self:inside()then self:returnMain(os.clock(),"Returning to main world",false)end end})
     self.statusLabel=section:Label({Text="Idle"})
-    self.Controls={Join=join,Farm=farm,Replay=replay,Start=start,Limit=limit,Speed=speed,Currency=currency}
+    self.Controls={Join=join,Farm=farm,Replay=replay,Start=start,Limit=limit,Leave=leave,Speed=speed,Currency=currency}
     task.spawn(function()
         local lastMax=-1
+        local speedSignature=table.concat(speedNames,"|")
         while self.alive and self.app.alive do
+            local definitions,options=self:speeds()
+            local signature=table.concat(options,"|")
+            if signature~=speedSignature then
+                speedSignature=signature
+                self.speed=definitions[self.speed]and self.speed or options[1]
+                self.updatingSpeeds=true
+                speed:ClearOptions()speed:InsertOptions(options)speed:UpdateSelection({self.speed})
+                self.updatingSpeeds=false self.speedAttempts=0 self.nextSpeed=0
+            end
             local open,left=Castle.schedule(self:now())
             self.availability:UpdateName(self:inside()and "Castle: Inside"or(open and "Castle: Open | Closes in "or "Castle: Closed | Opens in ")..math.ceil(left).."s")
             self.floorLabel:UpdateName("Floor: "..tostring(self.adapter.rs:GetAttribute("CurrentRoom")or "-").." | Record: "..self:maximum())
@@ -3236,6 +4114,436 @@ function Castle:Destroy()
     for _,connection in ipairs(self.connections)do connection:Disconnect()end
 end
 return Castle
+end)()
+
+local Desert=(function()
+-- Native InfiniteModeAction lobby / reset flow. Paid resets require a server offer and acknowledgement.
+local Desert={}
+Desert.__index=Desert
+function Desert.new(app,saved)
+    saved=type(saved)=="table"and saved or {}
+    local self=setmetatable({app=app,adapter=app.adapter,alive=true,joinEnabled=false,farmEnabled=false,replayEnabled=false,
+        startChoice="Wave 1",stopWave=1500,leaveAtStop=true,speed="Normal",priority="Nearest",status="Idle",
+        connections={},nextAction=0,nextSearch=0,attempts=0,returnAttempts=0,world=tonumber(saved.world)or app.adapter.world,
+        payment=type(saved.payment)=="table"and saved.payment.jobId==game.JobId and saved.payment or nil},Desert)
+    self.info=self.adapter.partyInfo and self.adapter.partyInfo.MODES.desert
+    table.insert(self.connections,self.adapter.infiniteBridge:Connect(function(m)
+        if self.alive and type(m)=="table"then self:onEvent(m,os.clock())end
+    end))
+    table.insert(self.connections,self.adapter.player.CharacterAdded:Connect(function()
+        self.target=nil self.nextSearch=0 self.app.movement:stop()self.app.movement.corrections=0
+    end))
+    return self
+end
+function Desert:inside()
+    return self.adapter.rs:GetAttribute("InInfinite")==true and self.adapter.rs:GetAttribute("InInfiniteC")~=true
+        and self.adapter.rs:GetAttribute("InInfiniteL")~=true and self.adapter.rs:GetAttribute("IsCastle")~=true
+end
+function Desert:active()return self.joinEnabled or self.farmEnabled or self.replayEnabled end
+function Desert:maximum()
+    local wave=self.info and self.info.Wave or {}
+    local stats=self.adapter:getStats()local g=stats and stats:FindFirstChild("GeneralStats")
+    local best=tonumber(g and g:GetAttribute(wave.Stat or "InfiniteWave"))or 0
+    return best,math.max(1,tonumber(wave.Every)or 30),math.max(1,tonumber(wave.MaxCheck)or 1500)
+end
+function Desert:checkpoints()
+    local best,step,maximum=self:maximum()
+    local result={"Wave 1","Highest Checkpoint"}
+    for n=step,math.min(best,maximum),step do table.insert(result,tostring(n))end
+    return result
+end
+function Desert:checkpoint(maximum)
+    if self.startChoice=="Wave 1"then return false end
+    local best,step,limit=self:maximum()
+    if maximum then best=math.min(best,maximum)end
+    local highest=math.floor(math.min(best,limit)/step)*step
+    if self.startChoice=="Highest Checkpoint"then return highest>0 and highest or false end
+    local n=tonumber(self.startChoice)
+    if n and n>0 and n<=highest and n%step==0 then return n end
+end
+function Desert:release()
+    self.target=nil self.nextSearch=0
+    if self.owns then self.owns=false self.app:invalidate()end
+end
+function Desert:activate()
+    if self.app.castle then self.app.castle:stop("Infinite Desert selected")end
+    if self.app.hunterTest then self.app.hunterTest:stop("Infinite Desert selected")end
+    if self.app.mountHunt then self.app.mountHunt:setEnabled(false)end
+    if self.app.raid then self.app.raid:setEnabled(false)end
+    if self.app.worldBoss then self.app.worldBoss:setEnabled(false)end
+    if self.app.storm then self.app.storm:setEnabled(false)end
+    self.app:stopAll("Infinite Desert selected")
+    if self.app.dungeon then self.app.dungeon:stop("Infinite Desert selected")end
+    self.app.movement.corrections=0
+end
+function Desert:sync()
+    if not self.Controls then return end
+    self.syncing=true
+    for key,v in pairs({Join=self.joinEnabled,Farm=self.farmEnabled,Replay=self.replayEnabled})do
+        local c=self.Controls[key]if c:GetState()~=v then c:UpdateState(v)end
+    end
+    self.syncing=false
+end
+function Desert:setFlag(key,value)
+    if key~="joinEnabled"and key~="farmEnabled"and key~="replayEnabled"then return end
+    value=value==true
+    if self[key]==value then return end
+    if value and not self:active()then self:activate()end
+    self[key]=value
+    if key=="joinEnabled"then
+        if value then self.attempts=0 self.startSent=nil self.nextAction=0
+        elseif self.pending then self:cancelPending()end
+    end
+    if not self:active()then self:release()self.status="Stopped"end
+    self:sync()
+    if value and not self.app.restoringConfig then self:prepareResume()end
+end
+function Desert:cancelPending()
+    local pending=self.pending
+    if not pending then return end
+    if pending.created and not self:inside()then
+        self.adapter.generalBridge:Fire({Event="InfiniteModeAction",Action="Leave",Dungeon=self.adapter.player.UserId})
+        self.pending=nil
+    else pending.cancelled=true end
+end
+function Desert:stop(reason)
+    self.joinEnabled,self.farmEnabled,self.replayEnabled=false,false,false
+    self:cancelPending()self:release()self.status=reason or "Stopped"self:sync()
+end
+function Desert:prepareResume()
+    if self.app.config then self.app.config:flush()end
+    if self.app.dungeon then self.app.dungeon:save()end
+    local env=getgenv()local queue=queue_on_teleport or queueonteleport
+    if type(queue)~="function"or env.__SenzyDesertQueue or not self.app.config then return end
+    local code=string.format([[
+task.spawn(function()
+ if not game:IsLoaded()then game.Loaded:Wait()end
+ if game.GameId~=%d then return end
+ local ok,p=pcall(function()return game:GetService("HttpService"):JSONDecode(readfile(%q))end)
+ if not ok or p.userId~=game:GetService("Players").LocalPlayer.UserId or not p.desert then return end
+ if not(p.desert.join or p.desert.farm or p.desert.replay)then return end
+ getgenv().__SenzyDesertResume=true
+ local source=readfile("SenzyAriseFarm/loader.luau")getgenv().__SenzyAriseFarmSource=source
+ assert(loadstring(source))()
+end)
+]],game.GameId,self.app.config.path)
+    local ok=pcall(queue,code)if ok then env.__SenzyDesertQueue=true end
+end
+function Desert:onEvent(m,now)
+    if m.Event=="CreatedInstance"and self.pending and type(m.DungeonInfo)=="table"
+        and tonumber(m.DungeonInfo.Leader)==self.adapter.player.UserId then
+        self.pending.created=true
+        if self.pending.cancelled or not self.joinEnabled then self:cancelPending()end
+    elseif m.Event=="StartedInstance"and type(m.DungeonInfo)=="table"
+        and table.find(m.DungeonInfo.Members or {},self.adapter.player.UserId)then
+        self.teleporting=true self:prepareResume()
+    elseif m.Event=="ShowSpeed"then self.speedUntil=now+(tonumber(m.Timer)or 5)self.speedAttempts=0
+    elseif m.Event=="ResetInfinite"then
+        self:release()
+        if not self:inside()then return end
+        self.resetOffer={price=tonumber(m.Price),maximum=tonumber(m.MaxWave),at=now,
+            expires=now+(tonumber(m.Timer)or(self.adapter.partyInfo and self.adapter.partyInfo.REJOIN_TIME)or 20)}
+    elseif m.Event=="Reseted"then
+        self.resetOffer=nil self.payment=nil self.target=nil self.seenWave=nil self.emptySince=nil
+        self.nextSearch=0 self.speedAttempts=0 self.speedUntil=now+5 self.wasRunning=true
+    elseif m.Event=="ResetInfiniteEnd"then self.resetOffer=nil end
+end
+function Desert:returnMain(now,reason)
+    self.returning=true self:release()self.status=reason or "Returning to main world"
+    if now<(self.nextReturn or 0)then return true end
+    if self.returnAttempts>=3 then self:stop("Return to main world not confirmed")return true end
+    self.returnAttempts+=1 self.nextReturn=now+10 self:prepareResume()
+    self.adapter.generalBridge:Fire({Event="LeaveDungeon"})return true
+end
+function Desert:joinStep(now)
+    if self.pending and self.pending.cancelled then
+        if now-self.pending.at>20 then self.pending=nil end
+        self.status="Waiting for cancelled party request"return false
+    end
+    if self.adapter.rs:GetAttribute("Dungeon")==true or self.adapter.rs:GetAttribute("InInfiniteC")==true
+        or self.adapter.rs:GetAttribute("InInfiniteL")==true or self.adapter.rs:GetAttribute("IsCastle")==true then
+        self.status="Return to the main world first"return false
+    end
+    local player=self.adapter.player
+    for _,key in ipairs({"InDungeon","InDungeonKey","InInfiniteCastle","InInfiniteLabyrinth","InBossRush","InTimeTrial"})do
+        if player:GetAttribute(key)==true then self.status="Leave the existing party first"return false end
+    end
+    local room=self.adapter:desertRoom()
+    if room and tonumber(room.Leader)~=player.UserId then self.status="Waiting for your party leader"return false end
+    local check=self:checkpoint()
+    if check==nil then self.status="Selected checkpoint is locked"return false end
+    if now<self.nextAction then return self.pending~=nil end
+    if not room then
+        if self.pending then
+            if now-self.pending.at<12 then self.status="Waiting for Desert party confirmation"return true end
+            self.pending=nil
+        end
+        if self.attempts>=3 then self.status="Party entry not confirmed - toggle Auto Join to retry"return false end
+        self.attempts+=1 self.pending={at=now,created=false}self.nextAction=now+2
+        self:prepareResume()
+        self.adapter.generalBridge:Fire({Event="InfiniteModeAction",Action="Create"})
+        self.status="Creating Infinite Desert party"return true
+    end
+    if room.Locked==true then
+        self.status="Entering Infinite Desert"
+        if self.pending and now-self.pending.at>40 then self:stop("Desert teleport not confirmed")end
+        return true
+    end
+    if self.startSent and now-self.startSent<25 then self.status="Waiting for Desert teleport"return true end
+    if self.startSent then self:stop("Desert start not confirmed - stopped")return false end
+    self:prepareResume()self.startSent=now self.nextAction=now+25
+    self.adapter.generalBridge:Fire({Event="InfiniteModeAction",Action="Start",Dungeon=player.UserId,Check=check and tostring(check)or nil})
+    self.status="Starting Infinite Desert"return true
+end
+function Desert:resetStep(now)
+    local offer=self.resetOffer
+    if not offer then return false end
+    if not self.replayEnabled then return self:returnMain(now,"Run ended - returning")end
+    if now>=offer.expires then return self:returnMain(now,"Replay window ended - returning")end
+    if self.payment then self.status="Waiting for replay confirmation"return true end
+    local stats=self.adapter:getStats()
+    local bind=self.adapter.waveRunClient and self.adapter.waveRunClient.GetConfig("InfiniteMode")
+    local minRank=bind and bind.Rejoin and tonumber(bind.Rejoin.MinRank)or 7
+    if(tonumber(stats and stats:GetAttribute("Rank"))or 0)<minRank then return self:returnMain(now,"Replay rank requirement not met")end
+    local inv=stats and stats:FindFirstChild("Inventory")local items=inv and inv:FindFirstChild("Items")
+    local tickets=items and items:FindFirstChild("Ticket")
+    local balance=tonumber(tickets and tickets:GetAttribute("Amount"))or 0
+    if not offer.price or offer.price<0 or offer.price==math.huge or balance<offer.price then
+        return self:returnMain(now,"Not enough Tickets / replay price unavailable")
+    end
+    local check=self:checkpoint(offer.maximum)
+    if check==nil then return self:returnMain(now,"Replay checkpoint is unavailable")end
+    self.payment={jobId=game.JobId,wave=tonumber(self.adapter.rs:GetAttribute("CurrentWave")),at=os.time(),price=offer.price}
+    self:prepareResume()
+    self.adapter.generalBridge:Fire({Event="InfiniteModeAction",Action="Reset",Check=check or nil})
+    self.status="Resetting Infinite Desert | Tickets: "..offer.price
+    return true
+end
+function Desert:portalPosition()
+    local world=self.adapter.main:FindFirstChild("__World")local map=world and world:FindFirstChild("InfiniteDesert")
+    if not map then return end
+    local pos=map:FindFirstChild("Pos")or map
+    for _,name in ipairs({"Portal","EndPortal","PortalBase","PortalEnd"})do
+        local item=pos:FindFirstChild(name,true)
+        if item then
+            if item:IsA("BasePart")then return item.Position end
+            if item:IsA("Model")then return item:GetPivot().Position end
+        end
+    end
+end
+function Desert:valid(enemy)
+    return self:inside()and self.adapter:enemyAlive(enemy)and enemy:GetAttribute("Shield")~=true
+end
+function Desert:selectEnemy(root)
+    local anchor=self.priority=="Closest to Portal"and self:portalPosition()or root.Position
+    self.portalMissing=anchor==nil anchor=anchor or root.Position
+    local best,distance,key=nil,math.huge,nil
+    for _,enemy in ipairs(self.adapter.enemies:GetChildren())do
+        if self:valid(enemy)then
+            local d=(enemy.Position-anchor).Magnitude
+            local hp=Catalog.healthKey(self.adapter:enemyHP(enemy))
+            local compare=Catalog.compareHealthKeys(hp,key)
+            if self.priority=="Highest HP"and(compare>0 or compare==0 and d<distance)
+                or self.priority~="Highest HP"and d<distance then best,distance,key=enemy,d,hp end
+        end
+    end
+    return best
+end
+function Desert:speedStep(now)
+    if self.adapter.rs:GetAttribute("InfiniteOwner")~=self.adapter.player.Name then return end
+    if self.adapter.rs:GetAttribute("Intermission")~=true and now>(self.speedUntil or 0)then return end
+    local definitions=self.adapter:desertSpeedCatalog()local desired=definitions[self.speed]
+    if not desired then return end
+    if tonumber(self.adapter.rs:GetAttribute("DesertSpeed"))==desired.value then self.speedAttempts=0 return end
+    if now<(self.nextSpeed or 0)or(self.speedAttempts or 0)>=2 then return end
+    self.nextSpeed=now+3 self.speedAttempts=(self.speedAttempts or 0)+1
+    self.adapter.generalBridge:Fire({Event="InfiniteModeAction",Action="SpeedUp",Speed=desired.request})
+end
+function Desert:_step(dt,now)
+    if not self:active()then self:release()return false end
+    if not self:inside()then
+        if self.wasRunning then
+            self:release()self.wasRunning=false self.resetOffer=nil self.returning=false self.payment=nil
+            self.pending=nil self.startSent=nil self.attempts=0 self.returnAttempts=0 self.nextReturn=nil self.nextAction=now+3
+        end
+        if self.joinEnabled then return self:joinStep(now)end
+        self.status="Waiting to enter Infinite Desert"return false
+    end
+    self.wasRunning=true self.pending=nil self.startSent=nil
+    if self.returning then return self:returnMain(now)end
+    if self:resetStep(now)then return true end
+    if not self.farmEnabled then self:release()self.status="Inside Infinite Desert"return false end
+    if not self.owns then self.app:invalidate()self.owns=true end
+    local wave=tonumber(self.adapter.rs:GetAttribute("CurrentWave"))or 0
+    if wave~=self.lastWave then self.lastWave=wave self.seenWave=nil self.emptySince=nil self.target=nil self.nextSearch=0 end
+    local count=0 for _,enemy in ipairs(self.adapter.enemies:GetChildren())do if self:valid(enemy)then count+=1 end end
+    if count>0 then self.seenWave=wave self.emptySince=nil
+    elseif self.seenWave==wave then self.emptySince=self.emptySince or now end
+    if wave>self.stopWave or wave==self.stopWave and self.emptySince and now-self.emptySince>=3 then
+        if self.leaveAtStop then return self:returnMain(now,"Stop wave cleared - returning")end
+        self:setFlag("farmEnabled",false)self.status="Stopped at wave "..wave return true
+    end
+    local character,root,humanoid=self.adapter:character()
+    local blocked=self.adapter:blocked(true)
+    if not character or blocked then self.app.movement:stop()self.status=blocked or "Waiting for your character"return true end
+    self:speedStep(now)
+    if self.target and not self:valid(self.target)then
+        self.target=nil self.app:invalidate()self.app.movement:waitAfterEnemy(now)
+    end
+    if not self.target and self.app.movement:waitingForEnemy(now)then self.status="Waiting after target death"return true end
+    if not self.target and now>=self.nextSearch then self.nextSearch=now+.15 self.target=self:selectEnemy(root)end
+    local target=self.target
+    if not target then self.app.movement:stop()self.status="Wave "..wave.." | Waiting for enemies"return true end
+    local goal=self.adapter:targetPosition(target,character,root,humanoid,now)
+    if not goal then self.status="Waiting for Desert floor"return true end
+    if self.app.shadowFollow then
+        local ready,reason=self.app.shadowFollow:beforeMove(target,character,root,goal,now)
+        if not ready then self.app.movement:stop()self.status=reason return true end
+    end
+    local arrived,message=self.app.movement:step(character,root,humanoid,goal,target.Position,"TP",self.app.speed,target,dt,now)
+    if message then if self.app.movement.corrections>=3 then self:stop(message)end self.status=message return true end
+    if not arrived then self.status="Moving to Desert enemy"return true end
+    if self.app.shadowFollow and not self.app.shadowFollow:afterMove(true,now)then self.status="Summoning shadows"return true end
+    if not self.farmEnabled or not self:valid(target)then return true end
+    if self.app.clickEnabled then self.adapter:autoClickInput(now,target)self.adapter:instanceClick(target,root,now)
+    else self.adapter:attack(target,root,now)end
+    self.status="Wave "..wave.." | Enemies: "..count..(self.portalMissing and " | Using nearest enemy"or "")
+    return true
+end
+function Desert:step(dt)
+    if not self.alive then return false end
+    local ok,result=pcall(self._step,self,dt,os.clock())
+    if not ok then self:stop("Desert stopped: "..tostring(result))warn("[senzy hub] "..self.status)return false end
+    return result
+end
+function Desert:mount(tab)
+    local section=tab:Section({Name="Infinite Desert",Side="Left"})
+    local waveLabel=section:Label({Text="Wave: - | Portal: -"})
+    local join,farm,replay,start,priority,speed
+    join=section:Toggle({Name="Auto Join Infinite Desert",Default=false,Callback=function(v)if not self.syncing then self:setFlag("joinEnabled",v)end end},"SenzyDesertJoin")
+    farm=section:Toggle({Name="Auto Farm Infinite Desert",Default=false,Callback=function(v)if not self.syncing then self:setFlag("farmEnabled",v)end end},"SenzyDesertFarm")
+    replay=section:Toggle({Name="Auto Replay (Tickets)",Default=false,Callback=function(v)if not self.syncing then self:setFlag("replayEnabled",v)end end},"SenzyDesertReplay")
+    local function selected(c)for value,on in pairs(c:GetOptions())do if on then return value end end end
+    start=section:Dropdown({Name="Start Wave",Options=self:checkpoints(),Default="Wave 1",Required=true,Callback=function()if start then self.startChoice=selected(start)or "Wave 1"end end},"SenzyDesertStart")
+    local _,_,maximum=self:maximum()
+    local limit=section:Slider({Name="Stop At Wave",Minimum=1,Maximum=maximum,Default=maximum,Precision=0,Callback=function(v)self.stopWave=math.clamp(math.floor(tonumber(v)or maximum),1,maximum)end},"SenzyDesertStop")
+    local leave=section:Toggle({Name="Leave At Stop Wave",Default=true,Callback=function(v)self.leaveAtStop=v==true end},"SenzyDesertLeave")
+    priority=section:Dropdown({Name="Target Priority",Options={"Nearest","Highest HP","Closest to Portal"},Default="Nearest",Required=true,Callback=function()if priority then self.priority=selected(priority)or "Nearest"end end},"SenzyDesertPriority")
+    local _,speedNames=self.adapter:desertSpeedCatalog()
+    speed=section:Dropdown({Name="Desert Speed",Options=speedNames,Default=speedNames[1],Required=true,Callback=function()if speed then self.speed=selected(speed)or speedNames[1]self.speedAttempts=0 self.nextSpeed=0 end end},"SenzyDesertSpeed")
+    section:Button({Name="Return To Main World",Callback=function()
+        local inside=self:inside()self:stop("Manual return")if inside then self.adapter.generalBridge:Fire({Event="LeaveDungeon"})end
+    end})
+    local status=section:Label({Text=self.status})
+    self.Controls={Join=join,Farm=farm,Replay=replay,Start=start,Limit=limit,Leave=leave,Priority=priority,Speed=speed}
+    task.spawn(function()
+        local lastBest,last,lastWave
+        while self.alive and self.app.alive do
+            local best=self:maximum()
+            if best~=lastBest then
+                lastBest=best local options=self:checkpoints()
+                if self:checkpoint()==nil then self.startChoice="Wave 1"end
+                start:ClearOptions()start:InsertOptions(options)start:UpdateSelection({self.startChoice})
+            end
+            local text="Wave: "..tostring(self.adapter.rs:GetAttribute("CurrentWave")or "-").." | Best: "..best
+                .." | Portal: "..tostring(self.adapter.rs:GetAttribute("PortalHealth")or "-")
+            if text~=lastWave then lastWave=text pcall(waveLabel.UpdateName,waveLabel,text)end
+            if self.status~=last then last=self.status pcall(status.UpdateName,status,self.status)end
+            task.wait(.5)
+        end
+    end)
+end
+function Desert:Destroy()
+    if not self.alive then return end
+    self.alive=false self:release()
+    for _,c in ipairs(self.connections)do c:Disconnect()end
+    table.clear(self.connections)
+end
+return Desert
+end)()
+
+local Wheel=(function()
+-- Use owned Spins only. Spin1/Spin5/Spin10 products are never requested.
+local Wheel={}
+Wheel.__index=Wheel
+function Wheel.new(app)
+    local self=setmetatable({app=app,adapter=app.adapter,alive=true,enabled=false,nextSpin=0,
+        completed=0,status="Off",connections={}},Wheel)
+    table.insert(self.connections,self.adapter.generalBridge:Connect(function(message)
+        if not self.alive or type(message)~="table"or message.Event~="Spin"or type(message.SpinInfo)~="table"then return end
+        local now=os.clock()
+        self.nextSpin=math.max(self.nextSpin,now+4.5)
+        local info=self.adapter.spinInfo and self.adapter.spinInfo[tonumber(message.SpinInfo.Id)]
+        self.lastReward=info and info.Name or "Reward received"
+        if self.pending then self.completed+=1 self.pending=nil end
+    end))
+    task.spawn(function()
+        while self.alive and app.alive do
+            if not app.restoringConfig then
+                local ok,err=pcall(self.step,self,os.clock())
+                if not ok then self:setEnabled(false)self.status="Spin stopped: "..tostring(err)end
+            end
+            task.wait(.25)
+        end
+    end)
+    return self
+end
+function Wheel:remaining()
+    local stats=self.adapter:getStats()
+    return stats and tonumber(stats:GetAttribute("Spins"))or 0
+end
+function Wheel:sync()
+    self.syncing=true
+    if self.Controls and self.Controls.Enabled:GetState()~=self.enabled then self.Controls.Enabled:UpdateState(self.enabled)end
+    self.syncing=false
+end
+function Wheel:setEnabled(value)
+    self.enabled=value==true
+    self.status=self.enabled and "Ready"or "Off"
+    -- Retain an in-flight request when switched off so a rapid re-enable cannot double-send.
+    self:sync()
+end
+function Wheel:step(now)
+    if not self.alive or not self.enabled then return end
+    local remaining=self:remaining()
+    if self.pending then
+        if remaining<self.pending.before then
+            self.completed+=1 self.pending=nil self.nextSpin=math.max(self.nextSpin,now+4.5)
+        elseif now-self.pending.at>10 then
+            self:setEnabled(false)self.status="Spin not confirmed - stopped"return
+        else self.status="Waiting for spin result"return end
+    end
+    if now<self.nextSpin then self.status="Spinning"return end
+    if self.adapter.player:GetAttribute("Teleporting")==true then self.status="Waiting for teleport"return end
+    if remaining<1 then self.status="Waiting for Spins"return end
+    self.pending={before=remaining,at=now}self.nextSpin=now+4.5 self.status="Spinning"
+    self.adapter.generalBridge:Fire({Event="SpinWheel"})
+end
+function Wheel:mount(tab)
+    local section=tab:Section({Name="Spin Wheel",Side="Right"})
+    local toggle
+    toggle=section:Toggle({Name="Auto Spin Wheel",Default=false,Callback=function(value)
+        if self.syncing or not self.alive or(toggle and toggle:GetState()~=(value==true))then return end
+        self:setEnabled(value)
+    end},"SenzyAutoSpinWheel")
+    local label=section:Label({Text="Spins: "..self:remaining()})
+    self.Controls={Enabled=toggle}
+    task.spawn(function()
+        local last
+        while self.alive and self.app.alive do
+            local text="Spins: "..self:remaining().." | "..self.status
+            if self.lastReward then text=text.." | "..self.lastReward end
+            if text~=last then last=text pcall(label.UpdateName,label,text)end
+            task.wait(.5)
+        end
+    end)
+end
+function Wheel:Destroy()
+    self.alive=false self.enabled=false
+    for _,c in ipairs(self.connections)do c:Disconnect()end
+    table.clear(self.connections)
+end
+return Wheel
 end)()
 
 local Sell=(function()
@@ -3454,14 +4762,23 @@ function Config.capture(app,previous)
         raid=r and {enabled=boolean(r.enabled),priority=r.priorityMode,loot=r.afterDefeat,returnAfter=boolean(r.returnAfter)}or {},
         mounts=m and {enabled=boolean(m.enabled),mount=m.filters.mount,rarity=m.filters.rarity}or {},
     }
+    if app.worldBoss then
+        local bosses={}for key,on in pairs(app.worldBoss.selected)do if on then table.insert(bosses,key)end end table.sort(bosses)
+        result.worlds[world].worldBoss={bosses=bosses,enabled=boolean(app.worldBoss.enabled)}
+    end
+    if app.storm then result.worlds[world].storm={enabled=boolean(app.storm.enabled),mode=app.storm.mode}end
     result.helpers=c and {equip=boolean(c.autoEquip),summon=boolean(c.autoSummon)}or {}
-    result.misc={click=boolean(app.clickEnabled)}
+    result.misc={click=boolean(app.clickEnabled),spin=app.wheel and boolean(app.wheel.enabled)or false}
     result.hunter={enabled=h and boolean(h.enabled)or false}
     result.defeat={mode=app.defeat and app.defeat.mode or nil}
     local castle=app.castle
     result.castle=castle and {join=castle.joinEnabled,farm=castle.farmEnabled,replay=castle.replayEnabled,
-        start=castle.floorChoice,limit=castle.stopFloor,speed=castle.speed,currency=castle.currency,
+        start=castle.floorChoice,limit=castle.stopFloor,leave=castle.leaveAtStop,speed=castle.speed,currency=castle.currency,
         native=copy(castle.native),payment=copy(castle.payment),blockedCycle=castle.blockedCycle}or nil
+    local desert=app.desert
+    result.desert=desert and {join=desert.joinEnabled,farm=desert.farmEnabled,replay=desert.replayEnabled,
+        start=desert.startChoice,limit=desert.stopWave,leave=desert.leaveAtStop,speed=desert.speed,priority=desert.priority,
+        payment=copy(desert.payment),world=desert.world}or nil
     result.sell=app.sell and copy(app.sell.options)or nil
     if result.sell then result.sell.enabled=app.sell.enabled end
     local link=s and s.link or ""
@@ -3565,7 +4882,7 @@ function Config:restore()
             dropdown(app.Controls.Island,{island.name})
             app.Controls.Monster:ClearOptions()app.Controls.Monster:InsertOptions(all)
             app.Controls.Monster:SetVisibility(true)
-        else dropdown(app.Controls.Island,{})app.Controls.Monster:SetVisibility(false)end
+        else dropdown(app.Controls.Island,{})app.Controls.Monster:SetVisibility(true)end
         app:selectMonster(labels)dropdown(app.Controls.Monster,labels)
         app.movement.tpDelay=number(farm.delay,1,0,10)
         if app.Controls.TPDelay then app.Controls.TPDelay:UpdateValue(app.movement.tpDelay)end
@@ -3604,6 +4921,7 @@ function Config:restore()
         app.clickEnabled=boolean(misc.click)
         app.clickStatus=app.clickEnabled and "Ready - stand near an enemy" or "Off"
         toggle(app.Controls.MiscClick,app.clickEnabled)
+        if app.wheel then app.wheel:setEnabled(boolean(misc.spin))end
         -- Apply active modes only after all filters and widget options are valid.
         if not resumeHunter then
             if boolean(farm.spawn)and island then app:setAutoSpawn(true)end
@@ -3626,7 +4944,9 @@ function Config:restore()
             castle.floorChoice=type(cs.start)=="string"and cs.start or "First Floor"
             if Castle.resolveFloor(castle.floorChoice,castle:maximum())==nil then castle.floorChoice="First Floor"end
             castle.stopFloor=math.floor(number(cs.limit,1000,1,1000))
-            castle.speed=option(cs.speed,{"Normal","Faster","Fastest"},"Normal")
+            castle.leaveAtStop=cs.leave~=false toggle(castle.Controls.Leave,castle.leaveAtStop)
+            local _,speedOptions=castle:speeds()
+            castle.speed=option(cs.speed,speedOptions,speedOptions[1])
             castle.currency=option(cs.currency,{"Gems","Ticket"},"Ticket")
             dropdown(castle.Controls.Start,{castle.floorChoice})castle.Controls.Limit:UpdateValue(castle.stopFloor)
             dropdown(castle.Controls.Speed,{castle.speed})dropdown(castle.Controls.Currency,{castle.currency=="Ticket"and "Tickets"or "Gems"})
@@ -3637,6 +4957,51 @@ function Config:restore()
             castle:sync()
         end
         if app.sell then app.sell:restore(saved.sell)end
+        if app.worldBoss then
+            local wb=app.worldBoss
+            local wc=type(data.worldBoss)=="table"and data.worldBoss or {}
+            local chosen={}local keys={}
+            for _,key in ipairs(type(wc.bosses)=="table"and wc.bosses or {})do
+                local entry=wb.byKey[key]
+                if entry and not keys[key]then keys[key]=true table.insert(chosen,entry.label)end
+            end
+            wb:select(chosen)dropdown(wb.Controls.Boss,chosen)
+            local otherMode=resumeHunter or resumeDungeon or h.enabled or m.enabled
+                or d.joinEnabled or d.farmEnabled or d.replayEnabled
+                or app.castle and(app.castle.joinEnabled or app.castle.farmEnabled or app.castle.replayEnabled)
+            if not otherMode and boolean(wc.enabled)and next(wb.selected)then wb:setEnabled(true)end
+            wb:sync()
+        end
+        if app.storm then
+            local sc=type(data.storm)=="table"and data.storm or {}
+            app.storm:setMode(option(sc.mode,{"All Monsters","Normal Only","Brutes Only"},"All Monsters"))
+            dropdown(app.storm.Controls.Mode,{app.storm.mode})
+            local otherMode=resumeHunter or resumeDungeon or h.enabled or m.enabled
+                or d.joinEnabled or d.farmEnabled or d.replayEnabled
+                or app.castle and(app.castle.joinEnabled or app.castle.farmEnabled or app.castle.replayEnabled)
+            if not otherMode and boolean(sc.enabled)then app.storm:setEnabled(true)end
+            app.storm:sync()
+        end
+        if app.desert then
+            local ds=app.desert local dc=type(saved.desert)=="table"and saved.desert or {}
+            ds.startChoice=type(dc.start)=="string"and dc.start or "Wave 1"
+            local validCheckpoint=ds:checkpoint()~=nil
+            if not validCheckpoint then ds.startChoice="Wave 1"end
+            local _,_,maximum=ds:maximum()
+            ds.stopWave=math.floor(number(dc.limit,maximum,1,maximum))ds.leaveAtStop=dc.leave~=false
+            local _,speedOptions=ds.adapter:desertSpeedCatalog()
+            ds.speed=option(dc.speed,speedOptions,speedOptions[1])
+            ds.priority=option(dc.priority,{"Nearest","Highest HP","Closest to Portal"},"Nearest")
+            dropdown(ds.Controls.Start,{ds.startChoice})ds.Controls.Limit:UpdateValue(ds.stopWave)
+            toggle(ds.Controls.Leave,ds.leaveAtStop)dropdown(ds.Controls.Speed,{ds.speed})dropdown(ds.Controls.Priority,{ds.priority})
+            local otherMode=resumeHunter or resumeDungeon or h.enabled or m.enabled or r.enabled
+                or d.joinEnabled or d.farmEnabled or d.replayEnabled
+                or app.castle and(app.castle.joinEnabled or app.castle.farmEnabled or app.castle.replayEnabled)
+            if (self.context.desert or ds:inside()or not otherMode)and validCheckpoint then
+                ds:setFlag("joinEnabled",boolean(dc.join))ds:setFlag("farmEnabled",boolean(dc.farm))ds:setFlag("replayEnabled",boolean(dc.replay))
+            end
+            ds:sync()
+        end
         local helpers=type(saved.helpers)=="table"and saved.helpers or {}
         c:setAutoEquip(boolean(helpers.equip))c:setAutoSummon(boolean(helpers.summon))
         if app.defeat then
@@ -3656,6 +5021,7 @@ end
 function Config:start()
     table.insert(self.connections,self.app.adapter.player.OnTeleport:Connect(function()self:flush()end))
     self:restore()self.ready=true self:flush()
+    if self.app.desert and self.app.desert:active()then self.app.desert:prepareResume()end
     task.spawn(function()
         while self.alive and self.app.alive do self:flush()task.wait(.25)end
     end)
@@ -3673,6 +5039,11 @@ local UI=(function()
 local UI = {}
 
 function UI.mount(app)
+    app.uiIdentity=type(getthreadidentity)=="function"and getthreadidentity()or 8
+    local function restoreUIContext()
+        if type(setthreadidentity)=="function"then setthreadidentity(app.uiIdentity)end
+    end
+    restoreUIContext()
     local library = assert(loadstring(game:HttpGet(
         "https://raw.githubusercontent.com/SYMBIOSHUB/SYMBIOS-HUB/refs/heads/main/UI/Symbios-ui.lua"
     )))()
@@ -3683,10 +5054,22 @@ function UI.mount(app)
     app.window = window
     local group = Config.guardGroup(app,window:TabGroup())
     local tab = group:Tab({Name = "Farm"})
-    local selection = tab:Section({Name = "Target", Side = "Left"})
-    local controls = tab:Section({Name = "Farm", Side = "Right"})
+    local selection = tab:Section({Name = "Farm", Side = "Left"})
+    local controls = selection
     local monsterDropdown, islandDropdown, toggle, spawnToggle
     local updating = false
+    local function refreshMonsters()
+        if not monsterDropdown then return end
+        updating=true
+        local options,active={},{}
+        if app.island then for _,m in ipairs(app.island.monsters)do
+            table.insert(options,m.label)
+            if app.selectedIds[m.id]then table.insert(active,m.label)end
+        end end
+        monsterDropdown:ClearOptions()monsterDropdown:InsertOptions(options)
+        monsterDropdown:UpdateSelection(active)monsterDropdown:SetVisibility(true)
+        updating=false
+    end
     local function selected(dropdown)
         if not dropdown then return nil end
         for name, active in pairs(dropdown:GetOptions()) do if active then return name end end
@@ -3705,21 +5088,11 @@ function UI.mount(app)
         Callback = function(value)
             if not app.alive or updating or not islandDropdown then return end
             value = selected(islandDropdown)
-            if app.island==app.catalog.byName[value]then return end
-            app:selectIsland(value)
-            stopToggle()
-            updating = true
-            if monsterDropdown then
-                monsterDropdown:UpdateSelection({})
-                monsterDropdown:ClearOptions()
-                local options = {}
-                if app.island then
-                    for _, monster in ipairs(app.island.monsters) do table.insert(options, monster.label) end
-                end
-                monsterDropdown:InsertOptions(options)
-                monsterDropdown:SetVisibility(app.island ~= nil)
+            if app.island~=app.catalog.byName[value]then
+                app:selectIsland(value)
+                stopToggle()
             end
-            updating = false
+            refreshMonsters()
         end,
     }, "SenzyAriseIsland")
     monsterDropdown = selection:Dropdown({
@@ -3737,7 +5110,7 @@ function UI.mount(app)
             stopToggle()
         end,
     }, "SenzyAriseMonster")
-    monsterDropdown:SetVisibility(false)
+    monsterDropdown:SetVisibility(true)
     local tpDelay=controls:Slider({Name="Delay After Kill (s)",Minimum=0,Maximum=10,Default=1,Precision=2,
         Callback=function(value)
             local delay=tonumber(value)
@@ -3767,19 +5140,27 @@ function UI.mount(app)
         if app.companions then app.companions:mount(app.hunterTest.tab)end
         if app.defeat then app.defeat:mount(app.hunterTest.tab)end
     end
+    restoreUIContext()
+    if app.worldBoss then app.worldBoss:mount(tab)end
+    if app.storm then app.storm:mount(tab)end
     if app.mountHunt then app.mountHunt:mount(tab) end
     if app.dungeon then app.dungeon:mount(group) end
     if app.raid then
         app.raid:mount(group)
         if app.castle then app.castle:mount(app.raid.tab)end
+        restoreUIContext()
+        if app.desert then app.desert:mount(app.raid.tab)end
     end
+    -- Reassert the executor UI context after native game-module reads during Castle mount.
+    restoreUIContext()
     if app.sell then app.sell:mount(group)end
     if app.server then app.server:mount(group)end
+    restoreUIContext()
     local misc=group:Tab({Name="Misc"})
     local clickSection=misc:Section({Name="Instance Click",Side="Left"})
     local clickToggle
     clickToggle=clickSection:Toggle({
-        Name="Instance Click (game cooldown)",Default=false,
+        Name="Auto Click + Fast Attack",Default=false,
         Callback=function(value)
             if not app.alive or (clickToggle and clickToggle:GetState()~=(value==true))then return end
             app.clickEnabled=value==true
@@ -3791,6 +5172,7 @@ function UI.mount(app)
         if clickToggle and clickToggle:GetState()then clickToggle:UpdateState(false)end
     end
     app.Controls.MiscClick=clickToggle
+    if app.wheel then app.wheel:mount(misc)end
     task.spawn(function()
         local last=nil
         while app.alive do
@@ -3800,6 +5182,7 @@ function UI.mount(app)
         end
     end)
     window.onUnloaded(function() app:Destroy() end)
+    restoreUIContext()
     tab:Select()
 end
 
@@ -3814,7 +5197,8 @@ local env=getgenv()
 local resume=env.__SenzyDungeonResume==true env.__SenzyDungeonResume=nil
 local hunterResume=env.__SenzyHunterResume==true env.__SenzyHunterResume=nil
 local castleResume=env.__SenzyCastleResume==true env.__SenzyCastleResume=nil
-if resume or hunterResume or castleResume then
+local desertResume=env.__SenzyDesertResume==true env.__SenzyDesertResume=nil
+if resume or hunterResume or castleResume or desertResume then
     if env.__SenzyResumeBootJob==game.JobId then return end
     env.__SenzyResumeBootJob=game.JobId
 end
@@ -3846,7 +5230,9 @@ if not hunterResume and sameJob and hr and hr.enabled==true and type(hr.started)
     if pending or running then hunterSaved=hr hunterRestore=true end
 end
 if not resume and sameJob and inInstance and rs:GetAttribute("IsTest")~=true
-    and rs:GetAttribute("IsCastle")~=true and type(runtime.dungeonSession)=="table"then
+    and rs:GetAttribute("IsCastle")~=true and rs:GetAttribute("InInfinite")~=true
+    and rs:GetAttribute("InInfiniteC")~=true and rs:GetAttribute("InInfiniteL")~=true
+    and type(runtime.dungeonSession)=="table"then
     local world=type(profile)=="table"and profile.lastWorld or saved.world
     local worlds=type(profile.worlds)=="table"and profile.worlds or {}
     local data=type(worlds[tostring(world)])=="table"and worlds[tostring(world)].dungeon or {}
@@ -3870,14 +5256,18 @@ local ok,err=pcall(function()
     adapter:refreshStats(os.clock())
     app.dungeon=Dungeon.new(app,saved,dungeonRestore)
     app.raid=Raid.new(app)
+    app.worldBoss=WorldBoss.new(app)
+    app.storm=Storm.new(app)
     app.mountHunt=MountHunt.new(app)
     app.hunterTest=HunterTest.new(app,hunterSaved,hunterRestore)
     app.companions=Companions.new(app,false)
     app.server=Server.new(app)
     app.defeat=Defeat.new(app)
     app.castle=Castle.new(app,profile and profile.castle)
+    app.desert=Desert.new(app,profile and profile.desert)
     app.sell=Sell.new(app)
-    app.config=Config.new(app,profile,{dungeon=dungeonRestore,hunter=hunterRestore})
+    app.wheel=Wheel.new(app)
+    app.config=Config.new(app,profile,{dungeon=dungeonRestore,hunter=hunterRestore,desert=desertResume})
     app.restoringConfig=true
     UI.mount(app)
     app.config:start()
@@ -3890,4 +5280,3 @@ getgenv().__SenzyAriseFarmSource=source
 local run,err=loadstring(source)
 assert(run,err)
 run()
-
