@@ -1,7 +1,5 @@
 -- ARISE 1.0 | senzy hub | by prxwqay
--- v1.4: resume an enabled Hunter Test from native instance state; reacquire enemies per room.
--- Built from the attached v1.3. Not executed or tested, as requested.
--- Full standalone source; existing UI, preferences and other farm modes are preserved.
+-- v1.9: scheduled one-shot island check; stop immediately on confirmed Ant King death.
 local source=[=[
 local Catalog=(function()
 -- Pure catalog helpers. Island membership comes from its quest chain, not World alone.
@@ -1048,11 +1046,11 @@ function Controller:setMode(mode)
     if self.mode ~= mode then self:invalidate() self.mode=mode end
 end
 
-function Controller:stopAll(message)
-    if self.raid and self.raid.owns then self.raid:setEnabled(false)end
+function Controller:stopAll(message,preserveEvents)
+    if not preserveEvents and self.raid and self.raid.owns then self.raid:setEnabled(false)end
     if self.desert and self.desert.owns then self.desert:stop(message)end
-    if self.storm and self.storm.owns then self.storm:setEnabled(false)end
-    if self.worldBoss and self.worldBoss.owns then self.worldBoss:setEnabled(false)end
+    if not preserveEvents and self.storm and self.storm.owns then self.storm:setEnabled(false)end
+    if not preserveEvents and self.worldBoss and self.worldBoss.owns then self.worldBoss:setEnabled(false)end
     self.enabled, self.autoSetSpawn = false, false
     self:invalidate()
     self.status = message or "Stopped"
@@ -1603,11 +1601,8 @@ function Dungeon:setReplay(value)
     self.replayEnabled=value==true
     if self.replayEnabled then
         if self.app.desert then self.app.desert:stop("Dungeon selected")end
-        if self.app.worldBoss then self.app.worldBoss:setEnabled(false)end
-        if self.app.storm then self.app.storm:setEnabled(false)end
         if self.app.hunterTest then self.app.hunterTest:stop("Dungeon selected")end
         if self.app.mountHunt then self.app.mountHunt:setEnabled(false)end
-        if self.app.raid then self.app.raid:setEnabled(false)end
     elseif not self.joinEnabled then self:cancelPending()self:release()end
     self:save()self:prepareResume()
 end
@@ -1748,12 +1743,9 @@ function Dungeon:setFilter(key,value)
 end
 function Dungeon:setJoin(enabled)
     if enabled and self.app.desert then self.app.desert:stop("Dungeon selected")end
-    if enabled and self.app.storm then self.app.storm:setEnabled(false)end
-    if enabled and self.app.worldBoss then self.app.worldBoss:setEnabled(false)end
     if enabled and self.app.castle then self.app.castle:stop("Dungeon selected")end
     if enabled and self.app.hunterTest then self.app.hunterTest:stop("Dungeon selected") end
     if enabled and self.app.mountHunt then self.app.mountHunt:setEnabled(false) end
-    if enabled and self.app.raid then self.app.raid:setEnabled(false) end
     self.joinEnabled=enabled==true
     self.generation+=1
     if not self:wantsEntry()then self:cancelPending()self:release()end
@@ -1763,12 +1755,9 @@ function Dungeon:setJoin(enabled)
 end
 function Dungeon:setFarm(enabled)
     if enabled and self.app.desert then self.app.desert:stop("Dungeon selected")end
-    if enabled and self.app.storm then self.app.storm:setEnabled(false)end
-    if enabled and self.app.worldBoss then self.app.worldBoss:setEnabled(false)end
     if enabled and self.app.castle then self.app.castle:stop("Dungeon selected")end
     if enabled and self.app.hunterTest then self.app.hunterTest:stop("Dungeon selected") end
     if enabled and self.app.mountHunt then self.app.mountHunt:setEnabled(false) end
-    if enabled and self.app.raid then self.app.raid:setEnabled(false) end
     self.farmEnabled=enabled==true
     if not self.farmEnabled and self.owner=="farm" then self:release()self.target=nil end
     self:save()
@@ -2190,6 +2179,7 @@ function Raid:state()
         self.windowCycle=cycle self.streamRequested=false self.stateNext=0
         self.emptySince=nil self.probeStarted=nil self.retryAt=0 self.clearedCycle=nil
         self.seenLiving=false self.returnCycle=nil self.returning=false self.active=false
+        self.arrivedAt=nil self.checkedEmptyCycle=nil self.discoveryStarted=nil
         self.target=nil self.nextScan=0 table.clear(self.corpses)table.clear(self.records)
         table.clear(self.retired)table.clear(self.availabilityRetired)
     end
@@ -2208,10 +2198,12 @@ function Raid:state()
         self.loadedCount=count self.loadedAttackable=attackable
     end
     if count>0 and self.finishedCycle~=cycle then
+        self.discoveryStarted=nil
         self.clearedCycle=nil self.emptySince=nil self.seenLiving=true
         if attackable>0 then self.retryAt=0 end
     end
-    return self.finishedCycle~=cycle and count>0,count,left,cycle
+    -- Stale streamed enemies cannot keep a closed round alive.
+    return self.finishedCycle~=cycle and open,count,left,cycle
 end
 
 function Raid.isRaidInfo(info)
@@ -2246,7 +2238,7 @@ function Raid.new(app)
     return self
 end
 function Raid:release()
-    self.emptySince=nil self.probeStarted=nil
+    self.emptySince=nil self.probeStarted=nil self.arrivedAt=nil
     if self.owns then self.app:invalidate()self.owns=false end
     self:restoreLootControl()
 end
@@ -2308,7 +2300,15 @@ function Raid:onEvent(message)
         self.stateNext=0 self.nextScan=0
     elseif message.Event=="EnemyDeath" and record and not record.dead then
         record.dead=true self.kills+=1
+        if record.id=="JJ4"and getmetatable(self)==Raid then
+            local _,_,cycle=Raid.window(self:serverNow(),self.adapter.balanceInfo.JejuIsland)
+            self:completeRound(cycle)return
+        end
     elseif message.Event=="EnemyArise" and message.CanArise==true and record and self.afterDefeat~="Ignore" then
+        if getmetatable(self)==Raid then
+            local _,_,cycle=Raid.window(self:serverNow(),self.adapter.balanceInfo.JejuIsland)
+            if self.finishedCycle==cycle then return end
+        end
         local chances=tonumber(message.Chances) or 3
         local c={enemy=key,id=record.id,position=message.Position or record.position,
             expires=now+(tonumber(self.adapter.balanceInfo.WaitToArise)or 4),chances=chances,attempts=0,nextTry=now}
@@ -2357,6 +2357,7 @@ function Raid:scan(root,now)
             end
             record.position=enemy.Position record.lastSeen=now
             if self:validEnemy(enemy) then
+                record.seenAlive=true
                 local s=Raid.priority(id,(root.Position-enemy.Position).Magnitude,self.priorityMode)
                 if s<score then best,score=enemy,s end
             end
@@ -2437,8 +2438,15 @@ function Raid:_step(dt)
     if not character then self.app.movement:stop()self.status="Waiting for character"return true end
     local now=os.clock()
     local open,count,_,cycle=self:state()
-    if self.active and count == 0 then self:completeRound(cycle) return false end
-    if not open and not self.active and not self.returning and next(self.corpses)==nil then self:release()self.status="Waiting for Dedu Raid"return false end
+    if self:kingDefeated()then self:completeRound(cycle)return false end
+    if not open then
+        self.active=false self.target=nil self:release()
+        self.status="Waiting for Dedu Raid"return false
+    end
+    if self.checkedEmptyCycle==cycle or count==0 and next(self.corpses)==nil and self.seenLiving then
+        self.checkedEmptyCycle=cycle self.active=false self.target=nil self:release()
+        self.status="Dedu skipped | Waiting for next round"return false
+    end
     if not self.owns then
         self.app:invalidate()self.owns=true self:takeLootControl()
         if self.returnCycle~=cycle then self.returnCycle=cycle self.returnPosition=root.Position end
@@ -2464,7 +2472,7 @@ function Raid:_step(dt)
             if self.enabled then self.status="Moving to Dedu Raid"end
             return true
         end
-        if not self.enabled or not self:validEnemy(target)then return true end
+        if not self.enabled or not self:state()or not self:validEnemy(target)then return true end
         local id=tostring(target:GetAttribute("Id")or target:GetAttribute("ID"))
         local info=self.adapter.enemyInfo[id]
         self.status=(info and info.Name or id).." | HP: "..tostring(self.adapter:enemyHP(target))
@@ -2489,16 +2497,32 @@ function Raid:_step(dt)
         end
         return true
     end
-    -- No discovery trip: wait briefly at the current position for a new wave/loot.
+    -- Scheduled availability is independent of whether this client has streamed the island.
     if count == 0 then
-        self.emptySince = self.emptySince or now
-        self.app.movement:stop()
-
-        self.active, self.returning, self.target = false, false, nil
-        self.clearedCycle = cycle
-        self.status = "Waiting for Dedu ants to spawn"
-        self:release()
-        return false
+        if not open then self.active=false self:release()return false end
+        self.discoveryStarted=self.discoveryStarted or now
+        if now-self.discoveryStarted>=30 then
+            self.checkedEmptyCycle=cycle self.active=false self:release()
+            self.status="Dedu verification ended | Waiting for next round"return false
+        end
+        local goal=self.adapter:spawnPosition({key="JejuEvent"},character,root,humanoid)
+        if not goal then
+            self.status="Waiting for Dedu island coordinates"
+            self.retryAt=now+5 self:release()return false
+        end
+        if self.adapter.requestArea then self.adapter:requestArea(goal,"Dedu:"..cycle,now)end
+        if not self:move(character,root,humanoid,goal,goal,"DeduEntry:"..cycle,dt,now)then
+            if self.enabled then self.status="Moving to Dedu island | Loading enemies"end
+            return true
+        end
+        self.arrivedAt=self.arrivedAt or now
+        self.status="Dedu open | Waiting for enemy data"
+        if now-self.arrivedAt>=3 then
+            self.checkedEmptyCycle=cycle self.active=false self:release()
+            self.status="No living Dedu enemies | Waiting for next round"
+            return false
+        end
+        return true
     end
     -- Shielded enemies are real spawns, but are not currently actionable.
     self.retryAt = now + 2
@@ -2507,6 +2531,17 @@ function Raid:_step(dt)
     return false
 end
 
+function Raid:kingDefeated()
+    -- A streamed-out model is not proof of death; require an observed living king and real death state.
+    for _,record in pairs(self.records)do
+        local enemy=record.instance
+        if record.id=="JJ4"and record.seenAlive and enemy and enemy.Parent==self.adapter.enemies then
+            local hp=tonumber(self.adapter:enemyHP(enemy))
+            if enemy:GetAttribute("Dead")==true or hp and hp<=0 then return true end
+        end
+    end
+    return false
+end
 function Raid:completeRound(cycle)
     if self.countedCycle ~= cycle then self.rounds += 1 self.countedCycle = cycle end
     self.finishedCycle, self.clearedCycle = cycle, cycle
@@ -2523,9 +2558,24 @@ function Raid:wantsWork()
     local now=os.clock()
     if self.target and not self.adapter:enemyAlive(self.target) then self.stateNext = 0 end
     local open,count,_,cycle=self:state()
-    if self.active and count == 0 then self:completeRound(cycle) return false end
+    if self:kingDefeated()then self:completeRound(cycle)return false end
+    if not open then self.active=false self.target=nil return false end
+    -- A negative inspection is final for this round, even if stale/late objects stream in later.
+    if self.checkedEmptyCycle==cycle then
+        self.active=false self.target=nil self.status="Dedu skipped | Waiting for next round"return false
+    end
     for key,c in pairs(self.corpses)do
         if now>=c.expires or self.afterDefeat=="Ignore"or typeof(c.position)~="Vector3"then self.corpses[key]=nil end
+    end
+    -- Pure observation while another task runs: never claim movement for a known-empty island.
+    if next(self.corpses)==nil then
+        if count==0 and(self.checkedEmptyCycle==cycle or self.seenLiving)then
+            self.checkedEmptyCycle=cycle self.active=false self.target=nil
+            self.status="No living Dedu enemies | Waiting for next round"return false
+        end
+        if count>0 and(self.loadedAttackable or 0)==0 then
+            self.status="Dedu enemies are shielded - waiting"return false
+        end
     end
     if self.returning and now-(self.finishAt or now)>=8 then self.returning=false end
     if (self.loadedAttackable or 0)==0 and now<(self.retryAt or 0)then return next(self.corpses)~=nil end
@@ -2548,9 +2598,10 @@ function Raid:availability()
     if not WORLD1[game.PlaceId]or self.adapter.rs:GetAttribute("Dungeon")==true
         or self.adapter.rs:GetAttribute("IsCastle")==true or self.adapter.rs:GetAttribute("InInfinite")==true then return "Raid: Unavailable in this world" end
     local open,count,left,cycle=self:state()
+    if open and self.checkedEmptyCycle==cycle then return "Raid: Skipped | Waiting for next round"end
     if open then return count>0 and "Raid: Active | Enemies: "..count or "Raid: Open | Enemies not loaded"end
-    if self.finishedCycle==cycle or self.clearedCycle==cycle then return "Raid: Cleared | Waiting for new enemies / next round"end
-    return "Raid: Waiting for live ants | No scouting teleports"
+    if self.finishedCycle==cycle then return "Raid: Cleared | Waiting for next round"end
+    return "Raid: Closed | Opens in "..math.ceil(left).."s"
 end
 function Raid:mount(group)
     local tab=group:Tab({Name="Raid"})
@@ -2672,7 +2723,7 @@ function WorldBoss:entryFor(enemy,selectedOnly)
     end
 end
 function WorldBoss:valid(enemy)
-    return (self.finishedCycle==nil or self.finishedCycle~=self.checkCycle)and self:entryFor(enemy,true)~=nil and not self.retired[enemy]
+    return self:window()and (self.finishedCycle==nil or self.finishedCycle~=self.checkCycle)and self:entryFor(enemy,true)~=nil and not self.retired[enemy]
         and self.adapter:enemyAlive(enemy)and enemy:GetAttribute("Shield")~=true
 end
 function WorldBoss:release()
@@ -2710,7 +2761,7 @@ function WorldBoss:wantsWork()
     if not self.enabled or next(self.selected)==nil or self.adapter:blocked()then return false end
     local character,root,humanoid=self.adapter:character()
     if not character then return false end
-    self:window()
+    if not self:window()then self.target=nil self.scout=nil return false end
     if self:valid(self.target)then return true end
     if self.target then return true end
     self:scan(root,os.clock())
@@ -2787,7 +2838,7 @@ function WorldBoss:_step(dt)
     local character,root,humanoid=adapter:character()
     if not character then self:release()self.status="Waiting for your character"return false end
     local now=os.clock()
-    self:window()
+    if not self:window()then self:release()self.status="Waiting for World Boss event"return false end
     if self.target and not self:valid(self.target)then
         if self.target.Parent==adapter.enemies and not adapter:enemyAlive(self.target)then
             self.kills+=1 self.retired[self.target]=true local entry=self:entryFor(self.target,true)
@@ -2830,6 +2881,8 @@ function WorldBoss:step(dt)
     return result
 end
 function WorldBoss:availability()
+    local eventOpen,eventLeft=self:window()
+    if not eventOpen then return "Boss: Next round in "..math.ceil(eventLeft).."s"end
     local names,seen={},{}
     for _,enemy in ipairs(self.adapter:enemyList())do
         local entry=self:entryFor(enemy,next(self.selected)~=nil)
@@ -2968,19 +3021,50 @@ function Storm.new(app)
     end))
     return self
 end
+function Storm:resolveLocation(raw)
+    local named=Storm.resolve(raw,self.app.catalog)
+    if named then return named end
+    local kind=typeof(raw)
+    local point=kind=="CFrame"and raw.Position or kind=="Vector3"and raw or nil
+    if not point then return end
+    local now=os.clock()
+    if self.positionRaw==raw and now<(self.nextPositionRead or 0)then return self.positionIsland end
+    self.positionRaw=raw self.nextPositionRead=now+2 self.positionIsland=nil
+    if self.adapter.cacheSpawns then self.adapter:cacheSpawns()end
+    local best,nearest,second=nil,math.huge,math.huge
+    for key,island in pairs(self.app.catalog.byKey)do
+        local spawn=self.adapter.spawnCache and self.adapter.spawnCache[key]
+        if spawn and typeof(spawn.position)=="Vector3"then
+            -- StormLocation is the elevated weather effect. Use horizontal map coordinates only.
+            local delta=spawn.position-point
+            local distance=Vector3.new(delta.X,0,delta.Z).Magnitude
+            if distance<nearest then second=nearest best,nearest=island,distance
+            elseif distance<second then second=distance end
+        end
+    end
+    -- This checks the weather marker's map association, never the player's travel distance.
+    if best and nearest<=2000 and(second==math.huge or nearest<second*.8)then self.positionIsland=best end
+    return self.positionIsland
+end
 function Storm:location()
+    local unresolved
     for _,root in ipairs({self.adapter.rs,workspace})do
         local raw=root:GetAttribute("StormLocation")
         if raw~=nil and raw~=false and raw~=""then
             self.attributeRoot=root
-            return Storm.resolve(raw,self.app.catalog),raw
+            local island=self:resolveLocation(raw)
+            if island then return island,raw end
+            unresolved=raw
         end
     end
     local signal=self.announcement
     if signal and signal.jobId==game.JobId and tonumber(signal.expires)and tonumber(signal.expires)>self:now()then
-        return Storm.resolve(signal.key,self.app.catalog),signal.key
+        local island=Storm.resolve(signal.key,self.app.catalog)
+        if island then return island,signal.key end
+        return nil,unresolved or signal.key
     end
     self.announcement=nil
+    return nil,unresolved
 end
 function Storm:release()
     self.target=nil self.nextSearch=0 self.emptySince=nil
@@ -3262,12 +3346,9 @@ function MountHunt:setEnabled(value)
     self:release()self.enabled=value self.target=nil self.nextSearch=0 self.dwellUntil=nil self.pendingCapture=nil
     if value then
         if self.app.desert then self.app.desert:stop("Mount hunt selected")end
-        if self.app.worldBoss then self.app.worldBoss:setEnabled(false)end
-        if self.app.storm then self.app.storm:setEnabled(false)end
         if self.app.castle then self.app.castle:stop("Mount hunt selected")end
         if self.app.hunterTest then self.app.hunterTest:stop("Mount hunt selected")end
-        self.app:stopAll("Mount hunt active")
-        if self.app.raid then self.app.raid:setEnabled(false)end
+        self.app:stopAll("Mount hunt active",true)
         local d=self.app.dungeon
         if d then d:setJoin(false)d:setFarm(false)if d.onStopped then d.onStopped()end end
         self.app.movement.corrections=0 self:refreshRoute()
@@ -3607,11 +3688,8 @@ function HunterTest:start()
     local ok,reason,rank=self:requirements()
     if not ok then self.status=reason return end
     if self.app.castle then self.app.castle:stop("Hunter Test selected")end
-    self.app:stopAll("Hunter Test active")
-    if self.app.worldBoss then self.app.worldBoss:setEnabled(false)end
-    if self.app.storm then self.app.storm:setEnabled(false)end
+    self.app:stopAll("Hunter Test active",true)
     if self.app.mountHunt then self.app.mountHunt:setEnabled(false)end
-    if self.app.raid then self.app.raid:setEnabled(false)end
     local d=self.app.dungeon
     d:setJoin(false)d:setFarm(false)if d.setReplay then d:setReplay(false)end
     if d.onStopped then d.onStopped()end
@@ -4271,10 +4349,7 @@ function Castle:activate()
     if self.app.desert then self.app.desert:stop("Infernal Castle selected")end
     if self.app.hunterTest then self.app.hunterTest:stop("Infernal Castle selected")end
     if self.app.mountHunt then self.app.mountHunt:setEnabled(false)end
-    if self.app.raid then self.app.raid:setEnabled(false)end
-    self.app:stopAll("Infernal Castle selected")
-    if self.app.worldBoss then self.app.worldBoss:setEnabled(false)end
-    if self.app.storm then self.app.storm:setEnabled(false)end
+    self.app:stopAll("Infernal Castle selected",true)
     self.app.dungeon:stop("Infernal Castle selected")
     self.adapter=self.app.adapter self.app.movement.corrections=0
 end
@@ -4606,10 +4681,7 @@ function Desert:activate()
     if self.app.castle then self.app.castle:stop("Infinite Desert selected")end
     if self.app.hunterTest then self.app.hunterTest:stop("Infinite Desert selected")end
     if self.app.mountHunt then self.app.mountHunt:setEnabled(false)end
-    if self.app.raid then self.app.raid:setEnabled(false)end
-    if self.app.worldBoss then self.app.worldBoss:setEnabled(false)end
-    if self.app.storm then self.app.storm:setEnabled(false)end
-    self.app:stopAll("Infinite Desert selected")
+    self.app:stopAll("Infinite Desert selected",true)
     if self.app.dungeon then self.app.dungeon:stop("Infinite Desert selected")end
     self.app.movement.corrections=0
 end
@@ -5302,6 +5374,7 @@ local Pumpkins = {}
             status = "Waiting for pumpkins", connections = {},
             attempts = setmetatable({}, {__mode = "k"}),
             confirmed = setmetatable({}, {__mode = "k"}),
+            keys = setmetatable({}, {__mode = "k"}), nextKey = 0,
         }, Pumpkins)
         table.insert(self.connections, self.adapter.generalBridge:Connect(function(message)
             if self.alive and type(message) == "table" and message.Event == "PumpkinDisable" then
@@ -5330,14 +5403,79 @@ local Pumpkins = {}
             self.confirmed[pumpkin] = true
             if self.attempts[pumpkin] then self.collected += 1 end
         end
-        if self.target == pumpkin then self.target = nil end
+        if self.target == pumpkin then
+            self.target = nil
+            if self.owns then self.app.movement:stop() end
+        end
         self.nextScan = 0
     end
 
     function Pumpkins:part(pumpkin)
         if not pumpkin or not pumpkin.Parent then return end
-        local part = pumpkin:FindFirstChild("Part")
-        if part and part:IsA("BasePart") then return part end
+        -- The direct child named Part is the tall sky effect, not the pickup anchor.
+        local main = pumpkin:FindFirstChild("Main")
+        if main and main:IsA("BasePart") then return main end
+        if main and main:IsA("Model") then
+            return main.PrimaryPart or main:FindFirstChildWhichIsA("BasePart", true)
+        end
+    end
+
+    function Pumpkins:prompt(pumpkin)
+        local main = pumpkin and pumpkin:FindFirstChild("Main")
+        return main and main:FindFirstChildWhichIsA("ProximityPrompt", true)
+    end
+
+    function Pumpkins:promptPosition(prompt, part)
+        local parent = prompt and prompt.Parent
+        if parent and parent:IsA("Attachment") then return parent.WorldPosition end
+        if parent and parent:IsA("BasePart") then return parent.Position end
+        if parent and parent:IsA("Model") then return parent:GetPivot().Position end
+        return part and part.Position
+    end
+
+    function Pumpkins:key(pumpkin)
+        if not self.keys[pumpkin] then
+            self.nextKey += 1
+            self.keys[pumpkin] = "PumpkinPickup:" .. self.nextKey
+        end
+        return self.keys[pumpkin]
+    end
+
+    function Pumpkins:canSee(character, from, point, prompt)
+        if not prompt.RequiresLineOfSight then return true end
+        local params = self.sightParams
+        if not params then
+            params = RaycastParams.new()
+            params.FilterType = Enum.RaycastFilterType.Exclude
+            params.IgnoreWater = true params.RespectCanCollide = true
+            self.sightParams = params
+        end
+        params.FilterDescendantsInstances = {character, self:folder()}
+        return workspace:Raycast(from, point - from, params) == nil
+    end
+
+    function Pumpkins:standingGoal(character, root, humanoid, point, radius, prompt)
+        local direction = Vector3.new(root.Position.X - point.X, 0, root.Position.Z - point.Z)
+        if direction.Magnitude < .1 then direction = Vector3.new(0, 0, 1) end
+        direction = direction.Unit
+        local offset = math.min(8, radius * .4)
+        local directions = {direction, -direction, Vector3.new(1,0,0), Vector3.new(-1,0,0),
+            Vector3.new(0,0,1), Vector3.new(0,0,-1)}
+        local best, distance
+        for _, side in ipairs(directions) do
+            local probe = point + side * offset
+            local floor = self.adapter:groundAt(probe, 8, 80)
+            if floor then
+                local goal = Vector3.new(probe.X,
+                    floor.Y + self.adapter:standingHeight(character, root, humanoid), probe.Z)
+                if (goal - point).Magnitude <= radius
+                    and self:canSee(character, goal + Vector3.new(0,1,0), point, prompt) then
+                    local d = (root.Position - goal).Magnitude
+                    if not distance or d < distance then best, distance = goal, d end
+                end
+            end
+        end
+        return best
     end
 
     function Pumpkins:available(pumpkin, now)
@@ -5348,6 +5486,8 @@ local Pumpkins = {}
             return false
         end
         if self.confirmed[pumpkin] or part.Transparency >= 1 then return false end
+        local prompt = self:prompt(pumpkin)
+        if not prompt or not prompt.Enabled or prompt.MaxActivationDistance <= 0 then return false end
         local main = pumpkin:FindFirstChild("Main")
         local icon = main and main:FindFirstChild("BillboardGui")
         if icon and icon:IsA("BillboardGui") and not icon.Enabled then return false end
@@ -5394,7 +5534,10 @@ local Pumpkins = {}
             end
         end
         -- Finish the current pickup before changing to a newly discovered pumpkin.
-        if not self.target or not self:available(self.target, now) then self.target = best end
+        if not self.target or not self:available(self.target, now) then
+            if self.target ~= best and self.owns then self.app.movement:stop() end
+            self.target = best
+        end
     end
 
     function Pumpkins:wantsWork()
@@ -5427,8 +5570,10 @@ local Pumpkins = {}
         if not self:wantsWork() then self:release() return false end
         local app, adapter, now = self.app, self.adapter, os.clock()
         local character, root, humanoid = adapter:character()
+        if not character or not root then self:release() return false end
         local pumpkin, part = self.target, self:part(self.target)
-        if not part then self.target = nil self:release() return false end
+        local prompt = self:prompt(pumpkin)
+        if not part or not prompt or not prompt.Enabled then self.target = nil self:release() return false end
         if not self.owns then app:invalidate() self.owns = true end
         local attempt = self.attempts[pumpkin]
         if not attempt then
@@ -5437,6 +5582,7 @@ local Pumpkins = {}
         end
         if attempt.retryAt then
             attempt.retryAt = nil attempt.started = now attempt.sent = 0 attempt.arrivedAt = nil
+            attempt.goal = nil attempt.movedAt = nil
         end
         if not attempt.arrivedAt and now - attempt.started > 60
             or attempt.arrivedAt and now - attempt.arrivedAt > 15
@@ -5446,50 +5592,59 @@ local Pumpkins = {}
             self.status = "Pickup unconfirmed - skipping and retrying later"
             return false
         end
-        local floor = adapter:groundAt(part.Position, 4, 128)
-        local goal = Vector3.new(part.Position.X,
-            floor and floor.Y + adapter:standingHeight(character, root, humanoid) or part.Position.Y + 2,
-            part.Position.Z)
-        adapter:requestArea(goal, "Pumpkin:" .. pumpkin.Name, now)
-        if app.shadowFollow then
-            local ready, reason = app.shadowFollow:beforeMove(pumpkin, character, root, goal, now)
-            if not ready then self.status = reason return true end
-        end
-        -- A string key prevents the movement system treating a pumpkin as an enemy hitbox.
-        local arrived, message = app.movement:step(character, root, humanoid, goal, part.Position,
-            "TP", app.speed, "Pumpkin:" .. pumpkin.Name, dt, now)
-        if message then
-            self.status = message
-            if app.movement.corrections >= 3 then self:setEnabled(false) end
+        local point = self:promptPosition(prompt, part)
+        local key = self:key(pumpkin)
+        local range = prompt.MaxActivationDistance
+        local radius = math.max(.1, range - math.min(2, range * .2))
+        if adapter.requestArea then adapter:requestArea(point, key, now) end
+        local within = (root.Position - point).Magnitude <= radius
+            and self:canSee(character, root.Position + Vector3.new(0,1,0), point, prompt)
+        if not within then
+            if not attempt.goal or now >= (attempt.nextGoal or 0) then
+                attempt.goal = self:standingGoal(character, root, humanoid, point, radius, prompt)
+                attempt.nextGoal = now + .75
+            end
+            if not attempt.goal then
+                app.movement:stop()
+                self.status = "Loading ground near pumpkin"
+                return true
+            end
+            local previous = root.Position
+            local _, message = app.movement:step(character, root, humanoid, attempt.goal, point,
+                "TP", app.speed, key, dt, now)
+            if (root.Position - previous).Magnitude > .5 then attempt.movedAt = now end
+            if message then
+                self.status = message
+                if app.movement.corrections >= 3 then self:setEnabled(false) end
+            else self.status = "Moving into pumpkin prompt range | Remaining: " .. self.visible end
             return true
         end
-        self.status = "Moving to pumpkin | Remaining: " .. self.visible
-        if not arrived then return true end
-        if app.shadowFollow and not app.shadowFollow:afterMove(true, now) then return true end
+        -- Pickup depends on the actual prompt range, not FloorMaterial or shadow arrival.
+        app.movement:stop()
         if not self.enabled or not self:available(pumpkin, now) then return false end
+        if attempt.movedAt and now - attempt.movedAt < .25 then
+            self.status = "Settling near pumpkin" return true
+        end
         attempt.arrivedAt = attempt.arrivedAt or now
         if now < attempt.nextTry or now < self.nextCollect then
             self.status = "Waiting for pumpkin collection confirmation"
             return true
         end
-        local prompt = pumpkin:FindFirstChildWhichIsA("ProximityPrompt", true)
-        if prompt and prompt.Enabled then
-            if (root.Position - part.Position).Magnitude > prompt.MaxActivationDistance then return true end
-            if type(fireproximityprompt) == "function" then
-                fireproximityprompt(prompt)
-            else
-                prompt:InputHoldBegin()
-                task.delay(math.max(0, prompt.HoldDuration), function()
+        local hold = math.max(0, prompt.HoldDuration)
+        local sent = false
+        if type(fireproximityprompt) == "function" then sent = pcall(fireproximityprompt, prompt) end
+        if not sent then
+            sent = pcall(prompt.InputHoldBegin, prompt)
+            if sent then
+                if hold == 0 then pcall(prompt.InputHoldEnd, prompt)
+                else task.delay(hold, function()
                     if prompt.Parent then pcall(prompt.InputHoldEnd, prompt) end
-                end)
+                end) end
             end
-        elseif (root.Position - part.Position).Magnitude <= 6 and type(firetouchinterest) == "function" then
-            firetouchinterest(root, part, 0)
-            firetouchinterest(root, part, 1)
         end
-        -- Without executor touch helpers, the physical arrival still uses the game's pickup contact.
-        attempt.sent += 1 attempt.nextTry = now + 2 self.nextCollect = now + 0.5
-        self.status = "Collecting pumpkin | Awaiting server confirmation"
+        if sent then attempt.sent += 1 end
+        attempt.nextTry = now + math.max(2, hold + .5) self.nextCollect = now + .5
+        self.status = sent and "Collecting pumpkin | Awaiting server confirmation" or "Pumpkin prompt input unavailable"
         return true
     end
 
@@ -6155,7 +6310,6 @@ function Config:restore()
             end
             if not resumeDungeon then
                 if boolean(mc.enabled)and mountValid and rarityValid then m:setEnabled(true)end
-                if boolean(rc.enabled)then r:setEnabled(true)end
                 if type(saved.hunter)=="table"and boolean(saved.hunter.enabled)then h:start()end
             end
         end
@@ -6190,7 +6344,7 @@ function Config:restore()
             local otherMode=resumeHunter or resumeDungeon or h.enabled or m.enabled
                 or d.joinEnabled or d.farmEnabled or d.replayEnabled
                 or app.castle and(app.castle.joinEnabled or app.castle.farmEnabled or app.castle.replayEnabled)
-            if not otherMode and boolean(wc.enabled)and next(wb.selected)then wb:setEnabled(true)end
+            if boolean(wc.enabled)and next(wb.selected)then wb:setEnabled(true)end
             wb:sync()
         end
         if app.storm then
@@ -6200,7 +6354,7 @@ function Config:restore()
             local otherMode=resumeHunter or resumeDungeon or h.enabled or m.enabled
                 or d.joinEnabled or d.farmEnabled or d.replayEnabled
                 or app.castle and(app.castle.joinEnabled or app.castle.farmEnabled or app.castle.replayEnabled)
-            if not otherMode and boolean(sc.enabled)then app.storm:setEnabled(true)end
+            if boolean(sc.enabled)then app.storm:setEnabled(true)end
             app.storm:sync()
         end
         if app.desert then
@@ -6234,6 +6388,8 @@ function Config:restore()
             local loot=type(saved.defeat)=="table"and saved.defeat or {}
             app.defeat:setMode(option(loot.mode,{"Arise","Destroy"},nil))app.defeat:sync()
         end
+        -- Dedu remains armed across resumed instance tasks and yields to their movement owner.
+        r:setEnabled(boolean(rc.enabled))
         toggle(app.Controls.Enabled,app.enabled)toggle(app.Controls.Spawn,app.autoSetSpawn)
         toggle(d.Controls.Join,d.joinEnabled)toggle(d.Controls.Farm,d.farmEnabled)toggle(d.Controls.Replay,d.replayEnabled)
         toggle(r.Controls.Enabled,r.enabled)toggle(m.Controls.Enabled,m.enabled)toggle(h.Controls.Enabled,h.enabled)
