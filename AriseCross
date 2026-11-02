@@ -1,7 +1,7 @@
 -- ARISE 1.0 | senzy hub | by prxwqay
--- v1.3: native Storm announcements, checkpoint enemy loading and pumpkin arrival/confirmation handling.
--- Based on the supplied v1.2. Storm and pumpkin changes still need live event validation.
--- Full standalone source; preserves saved preferences and teleport resume.
+-- v1.4: resume an enabled Hunter Test from native instance state; reacquire enemies per room.
+-- Built from the attached v1.3. Not executed or tested, as requested.
+-- Full standalone source; existing UI, preferences and other farm modes are preserved.
 local source=[=[
 local Catalog=(function()
 -- Pure catalog helpers. Island membership comes from its quest chain, not World alone.
@@ -3419,7 +3419,7 @@ return MountHunt
 end)()
 
 local HunterTest=(function()
--- One manually requested Hunter Rank Test, resumed only after the native StartTest acknowledgement.
+-- A requested Hunter Rank Test can resume from the destination's native IsTest flag.
 local HunterTest={}
 HunterTest.__index=HunterTest
 local SETTINGS="SenzyAriseFarm/hunter.json"
@@ -3441,17 +3441,27 @@ function HunterTest.canStart(rank,maxRank,info,awaken,hasQuest)
     return true,"Ready"
 end
 function HunterTest.new(app,saved,resume)
+    saved=type(saved)=="table"and saved or {}
     local self=setmetatable({app=app,adapter=app.adapter,alive=true,enabled=false,
         connections={},status="Idle",stage="idle",confirmed=false,waitStarted=os.clock(),world=app.adapter.world},HunterTest)
     self.info=self.adapter.testInfo
     self.startRank=tonumber(saved.rank)or 0
     self.started=tonumber(saved.started)or 0
-    if resume and saved.enabled==true and saved.confirmed==true and os.time()-self.started<1200 then
+    if self:nativeTest()and saved.enabled==true then
+        self.enabled=true self.confirmed=true self.world=tonumber(saved.world)or self.world
+        self.stage=saved.phase=="returning"and "returning"or "loading"
+        if self.started<=0 or os.time()-self.started<0 or os.time()-self.started>=1200 then self.started=os.time()end
+        if tonumber(saved.rank)==nil then
+            local stats=self.adapter:getStats()
+            self.startRank=tonumber(stats and stats:GetAttribute("Rank"))or 0
+        end
+        self.status="Loading Hunter Test"
+    elseif resume and saved.enabled==true and saved.confirmed==true and os.time()-self.started<1200 then
         self.enabled=true self.confirmed=true self.stage=saved.phase=="returning"and "returning"or "loading"
         self.world=tonumber(saved.world)or self.world
         self.status="Loading Hunter Test"
     end
-    if resume and saved.enabled==true and saved.confirmed~=true and saved.phase=="entering"
+    if not self.enabled and resume and saved.enabled==true and saved.confirmed~=true and saved.phase=="entering"
         and os.time()-self.started<60 then
         self.enabled=true self.confirmed=false self.stage="entering"self.status="Waiting for Hunter Test entry"
     end
@@ -3460,9 +3470,17 @@ function HunterTest.new(app,saved,resume)
     table.insert(self.connections,self.adapter.dungeonBridge:Connect(function(message)
         if not self.alive or not self.enabled or type(message)~="table"then return end
         if message.Event=="StartTest" and self.stage=="entering"then
-            self.confirmed=true self.status="Entering Hunter Test"self:save()
+            self.confirmed=true self.combat.timeLeft=nil self.timerStarted=false
+            self.status="Entering Hunter Test"self:save()
         elseif message.Event=="NotTp" and not self:inTest()then self:stop("Teleport failed")
-        elseif message.Event=="UpdateTimer" and type(message.TimeLeft)=="number"then self.combat.timeLeft=message.TimeLeft end
+        elseif message.Event=="UpdateTimer"and type(message.TimeLeft)=="number"and self:inTest()then
+            -- A zero from the entry countdown must not cancel a newly loaded test.
+            if message.TimeLeft>0 then self.timerStarted=true self.timerExpiredAt=nil end
+            if message.TimeLeft>0 or self.timerStarted then
+                self.combat.timeLeft=message.TimeLeft
+                if message.TimeLeft<=0 then self.timerExpiredAt=self.timerExpiredAt or os.clock()end
+            end
+        end
     end))
     table.insert(self.connections,self.adapter.player.OnTeleport:Connect(function(state)
         if not self.enabled then return end
@@ -3471,8 +3489,11 @@ function HunterTest.new(app,saved,resume)
         elseif state.Name=="Failed"then self.teleporting=false self:stop("Teleport failed")end
     end))
     table.insert(self.connections,self.adapter.player.CharacterAdded:Connect(function()
-        self.combat.target=nil self.app.movement.corrections=0
-        if self.stage=="running"then self:stop("Hunter Test interrupted")end
+        self.combat:release()self.combat.target=nil self.combat.nextEnemy=0 self.app.movement.corrections=0
+        self.room=nil self.roomChangedAt=nil self.finalEnemySeen=false self.finalEmptySince=nil
+        if self.enabled and self:inTest()then
+            self.stage="loading"self.status="Waiting for Hunter Test character"
+        end
     end))
     self:save()
     if self.enabled then self:prepareResume()end
@@ -3502,8 +3523,13 @@ function HunterTest:prepareResume()
         [88685840848627]=true,[112387026435138]=true}
     if not allowed[game.PlaceId]then return end
     local ok,saved=pcall(function()return game:GetService("HttpService"):JSONDecode(readfile("SenzyAriseFarm/hunter.json"))end)
-    if not ok or type(saved)~="table"or not saved.enabled or not saved.confirmed
+    if not ok or type(saved)~="table"or not saved.enabled
         or os.time()-(tonumber(saved.started)or 0)>1200 then return end
+    local rs=game:GetService("ReplicatedStorage")
+    local deadline=os.clock()+30
+    while (game.PlaceId==128336380114944 or game.PlaceId==73588121595735)
+        and rs:GetAttribute("IsTest")==nil and os.clock()<deadline do task.wait(.1)end
+    if not saved.confirmed and rs:GetAttribute("IsTest")~=true then return end
     getgenv().__SenzyHunterResume=true
     local source=readfile("SenzyAriseFarm/loader.luau")
     getgenv().__SenzyAriseFarmSource=source
@@ -3527,14 +3553,30 @@ function HunterTest:requirements()
         info,stats and stats:GetAttribute("Awaken")==true,quest)
     return ok,reason,rank,info
 end
+function HunterTest:nativeTest()
+    local rs=self.adapter.rs
+    if rs:GetAttribute("IsTest")~=true then return false end
+    for _,flag in ipairs({"HLRaid","IsCastle","IsHeavenCastle","InInfinite","InInfiniteC","InInfiniteL","InRush","InTimeTrial"})do
+        if rs:GetAttribute(flag)==true then return false end
+    end
+    return rs:GetAttribute("Dungeon")~=false
+end
 function HunterTest:inTest()
-    return self.enabled and self.confirmed and INSTANCES[game.PlaceId]==true
-        and self.adapter.rs:GetAttribute("Dungeon")==true
-        and self.adapter.rs:GetAttribute("HLRaid")~=true and self.adapter.rs:GetAttribute("IsCastle")~=true
+    if not self.enabled then return false end
+    if self:nativeTest()then return true end
+    local rs=self.adapter.rs
+    -- Compatibility only when the native discriminator has not been supplied.
+    if rs:GetAttribute("IsTest")~=nil then return false end
+    for _,flag in ipairs({"HLRaid","IsCastle","IsHeavenCastle","InInfinite","InInfiniteC","InInfiniteL","InRush","InTimeTrial"})do
+        if rs:GetAttribute(flag)==true then return false end
+    end
+    return self.confirmed and INSTANCES[game.PlaceId]==true and rs:GetAttribute("Dungeon")==true
 end
 function HunterTest:syncToggle()
     local toggle=self.Controls and self.Controls.Enabled
+    self.syncing=true
     if toggle and toggle:GetState()~=self.enabled then toggle:UpdateState(self.enabled)end
+    self.syncing=false
 end
 function HunterTest:stop(message)
     if not self.enabled and self.stage=="idle"then self:syncToggle()return end
@@ -3546,8 +3588,20 @@ function HunterTest:stop(message)
     self:save()self:syncToggle()
 end
 function HunterTest:start()
-    if self.app.desert then self.app.desert:stop("Hunter Test selected")end
     if not self.alive or self.enabled then return end
+    if self:nativeTest()then
+        local stats=self.adapter:getStats()
+        self.startRank=tonumber(stats and stats:GetAttribute("Rank"))or 0
+        self.started=os.time()self.waitStarted=os.clock()self.enabled=true self.confirmed=true
+        self.stage="loading"self.teleporting=false self.owns=false self.room=nil
+        self.returnAt=nil self.returnAttempts=0 self.finalEnemySeen=false self.finalEmptySince=nil
+        self.timerStarted=false self.timerExpiredAt=nil
+        self.combat:release()self.combat.target=nil self.combat.nextEnemy=0 self.combat.lastRoom=nil
+        self.combat.farmEnabled=true self.combat.timeLeft=nil self.app.movement.corrections=0
+        self.status="Loading current Hunter Test"self:save()self:syncToggle()
+        return
+    end
+    if self.app.desert then self.app.desert:stop("Hunter Test selected")end
     if not WORLDS[game.PlaceId]or self.adapter.rs:GetAttribute("Dungeon")==true then self.status="Return to the main world"return end
     if self.adapter.player:GetAttribute("InDungeon")==true then self.status="Leave the existing dungeon party first"return end
     local ok,reason,rank=self:requirements()
@@ -3564,6 +3618,7 @@ function HunterTest:start()
     self.startRank=rank self.started=os.time()self.waitStarted=os.clock()self.confirmed=false
     self.enabled=true self.stage="queued"self.teleporting=false
     self.returnAt=nil self.returnAttempts=0 self.finalEnemySeen=false self.finalEmptySince=nil
+    self.room=nil self.roomChangedAt=nil self.timerStarted=false self.timerExpiredAt=nil
     self.combat.farmEnabled=true self.combat.timeLeft=nil self.combat.target=nil
     self.app.movement.corrections=0
     local ready,err=self:prepareResume()
@@ -3577,6 +3632,13 @@ function HunterTest:finalBossCleared(now)
     local room=tonumber(self.adapter.rs:GetAttribute("CurrentRoom"))
     local maximum=tonumber(self.adapter.rs:GetAttribute("MaxDGRoom"))
     if not room or not maximum or maximum<1 or room<maximum then self.finalEmptySince=nil return false end
+    local message=self.adapter.rs:GetAttribute("DungeonMessage")
+    local left,total
+    if type(message)=="string"then
+        left,total=message:gsub("<[^>]*>",""):lower():match("enemies%s+left%s*:%s*(%d+)%s*/%s*(%d+)")
+        left,total=tonumber(left),tonumber(total)
+    end
+    if left and left>0 then self.finalEmptySince=nil return false end
     for _,enemy in ipairs(self.adapter:enemyList())do
         if self.adapter:enemyAlive(enemy)then
             local enemyRoom=enemy:GetAttribute("Room")or enemy:GetAttribute("RoomId")
@@ -3585,7 +3647,9 @@ function HunterTest:finalBossCleared(now)
             end
         end
     end
-    if not self.finalEnemySeen then return false end
+    if not self.finalEnemySeen then
+        if left~=0 or not total or total<1 or now-(self.roomChangedAt or now)<2 then return false end
+    end
     self.finalEmptySince=self.finalEmptySince or now
     return now-self.finalEmptySince>=4
 end
@@ -3603,34 +3667,60 @@ function HunterTest:returnToMain(now)
 end
 function HunterTest:_step(dt)
     if not self.enabled then return false end
-    if self.stage=="queued" then
+    local now=os.clock()
+    if self:nativeTest()and not self.confirmed then self.confirmed=true self:save()end
+    if self.stage=="queued"and not self:inTest()then
         if self.adapter.rs:GetAttribute("Dungeon")==true then return false end
         self.stage="entering"self.waitStarted=os.clock()
         self.adapter.generalBridge:Fire({Event="DungeonAction",Action="TestEnter"})
         return true
     end
     if not self.owns then self.app:invalidate()self.owns=true end
-    local rank=tonumber(self.adapter:getStats():GetAttribute("Rank"))
+    local stats=self.adapter:getStats()
+    local rank=tonumber(stats and stats:GetAttribute("Rank"))
     local inside=self:inTest()
     local passed=rank and rank>self.startRank
     if inside and(passed or self.stage=="returning")then return self:returnToMain(os.clock())end
     if not inside then
         self.app.movement:stop()
+        self.status="Waiting for Hunter Test instance"
         if WORLDS[game.PlaceId]and(passed or self.stage=="returning"or self.stage=="running"or self.stage=="loading")then
             self:stop((passed and "Passed | Rank: "or "Test ended | Rank: ")..tostring(self.adapter.basicInfo.Ranks[rank]or "No Rank"))
         elseif os.clock()-(self.waitStarted or os.clock())>60 then self:stop("Entry not confirmed - start again when ready")end
         return true
     end
-    self.stage="running"
+    if self.stage~="running"then
+        self.stage="running"self.combat.target=nil self.combat.nextEnemy=0 self.combat.lastRoom=nil
+        self.combat.timeLeft=self.timerStarted and self.combat.timeLeft or nil
+        self:save()
+    end
+    local room=self.adapter.rs:GetAttribute("CurrentRoom")
+    if room~=self.room then
+        self.room=room self.roomChangedAt=now self.finalEnemySeen=false self.finalEmptySince=nil
+        self.combat:release()self.combat.target=nil self.combat.nextEnemy=0 self.combat.lastRoom=nil
+        self.app.movement:stop()
+    end
     if self:finalBossCleared(os.clock())then return self:returnToMain(os.clock())end
-    if self.combat.timeLeft and self.combat.timeLeft<=0 then self:stop("Hunter Test time ended")return true end
+    if self.timerStarted and self.combat.timeLeft and self.combat.timeLeft<=0
+        and self.timerExpiredAt and now-self.timerExpiredAt>=2 then self:stop("Hunter Test time ended")return true end
     if os.time()-self.started>1100 then self:stop("Hunter Test timed out")return true end
     local character,root,humanoid=self.adapter:character()
     if not character then self.app.movement:stop()self.status="Waiting for character"return true end
     local blocked=self.adapter:blocked(true)
     if blocked then self.app.movement:stop()self.status=blocked return true end
+    if self.combat.target and not self.combat:aliveEnemy(self.combat.target)then
+        self.combat:release()self.combat.target=nil self.combat.nextEnemy=0
+        self.app.movement:stop()
+    end
+    if self.adapter.requestArea then
+        local target=self.combat.target
+        self.adapter:requestArea(target and target.Position or root.Position,
+            "HunterRoom:"..tostring(room),now)
+    end
     self.combat.farmEnabled=true
-    self.combat:farmStep(character,root,humanoid,dt,os.clock())
+    local expired=self.combat.timeLeft and self.combat.timeLeft<=0
+    if not expired then self.combat:farmStep(character,root,humanoid,dt,now)
+    else self.app.movement:stop()end
     self.status="Room "..tostring(self.adapter.rs:GetAttribute("CurrentRoom")or "?")
         .." / "..tostring(self.adapter.rs:GetAttribute("MaxDGRoom")or "?")
     if self.app.movement.corrections>=3 then self:stop("Movement was reset repeatedly")end
@@ -3656,7 +3746,7 @@ function HunterTest:mount(group)
     local rankLabel=section:Label({Text="Rank: ..."})
     local toggle
     toggle=section:Toggle({Name="Auto Hunter Test",Default=self.enabled,Callback=function(value)
-        if not self.alive or(toggle and toggle:GetState()~=(value==true))then return end
+        if not self.alive or self.syncing or(toggle and toggle:GetState()~=(value==true))then return end
         if value==true then self:start()self:syncToggle()
         elseif self.enabled then self:stop("Stopped")end
     end},"SenzyAutoHunterTest")
@@ -6387,7 +6477,38 @@ local hunterRestore=hunterResume
 local runtime=type(profile)=="table"and type(profile.runtime)=="table"and profile.runtime or {}
 local sameJob=runtime.jobId==game.JobId
 local hr=type(runtime.hunter)=="table"and runtime.hunter
-if not hunterResume and sameJob and hr and hr.enabled==true and type(hr.started)=="number"then
+-- A destination test is authoritative even when the pre-teleport acknowledgement was missed.
+local hunterIntent=hunterSaved.enabled==true
+    or sameJob and hr and hr.enabled==true
+    or type(profile)=="table"and type(profile.hunter)=="table"and profile.hunter.enabled==true
+local nativeHunter=rs:GetAttribute("IsTest")==true
+    and rs:GetAttribute("IsCastle")~=true and rs:GetAttribute("IsHeavenCastle")~=true
+    and rs:GetAttribute("HLRaid")~=true and rs:GetAttribute("InInfinite")~=true
+    and rs:GetAttribute("InInfiniteC")~=true and rs:GetAttribute("InInfiniteL")~=true
+    and rs:GetAttribute("InRush")~=true and rs:GetAttribute("InTimeTrial")~=true
+if nativeHunter and hunterIntent then
+    local session=sameJob and hr and hr.enabled==true and hr or hunterSaved
+    hunterSaved=table.clone(type(session)=="table"and session or {})
+    hunterSaved.enabled=true hunterSaved.confirmed=true
+    hunterSaved.phase=hunterSaved.phase=="returning"and "returning"or "loading"
+    local started=tonumber(hunterSaved.started)
+    if not started or started<=0 or os.time()-started<0 or os.time()-started>=1200 then
+        hunterSaved.started=os.time()
+    end
+    if tonumber(hunterSaved.rank)==nil then
+        local stats=playerData:stats()
+        hunterSaved.rank=tonumber(stats and stats:GetAttribute("Rank"))or 0
+    end
+    hunterRestore=true dungeonRestore=false
+elseif inInstance and hunterIntent and rs:GetAttribute("IsTest")==nil
+    and hunterSaved.enabled==true and hunterSaved.phase=="entering"
+    and tonumber(hunterSaved.started)and os.time()-tonumber(hunterSaved.started)>=0
+    and os.time()-tonumber(hunterSaved.started)<60 then
+    -- Keep the saved request pending while the destination's attributes finish loading.
+    hunterSaved=table.clone(hunterSaved)hunterSaved.confirmed=false
+    hunterRestore=true dungeonRestore=false
+end
+if not hunterRestore and sameJob and hr and hr.enabled==true and type(hr.started)=="number"then
     local pending=not inInstance and hr.phase=="entering"and os.time()-hr.started<60
     local running=inInstance and rs:GetAttribute("IsTest")==true and hr.confirmed==true and os.time()-hr.started<1200
     if pending or running then hunterSaved=hr hunterRestore=true end
