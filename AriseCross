@@ -6185,7 +6185,7 @@ function UI.mount(app)
         "https://raw.githubusercontent.com/SYMBIOSHUB/SYMBIOS-HUB/refs/heads/main/UI/Symbios-ui.lua"
     )))()
     local window = library:Window({
-        Title = "senzy hub", Subtitle = "ARISE 1.0 | by prxwqay",
+        Title = "Duckky Pray", Subtitle = "หีควยแตด",
         Size = UDim2.fromOffset(740, 440), Keybind = Enum.KeyCode.RightControl,
     })
     app.window = window
