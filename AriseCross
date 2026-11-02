@@ -1,7 +1,7 @@
 -- ARISE 1.0 | senzy hub | by prxwqay
--- v1.2: spawn-driven Dedu, paced Fast Attack, Auto Dash, Halloween Raid and Pumpkin collection.
--- Self-contained senzy hub. Saved preferences and toggle states restore automatically.
--- Small executor files store the loader and automation settings for teleport resume.
+-- v1.3: native Storm announcements, checkpoint enemy loading and pumpkin arrival/confirmation handling.
+-- Based on the supplied v1.2. Storm and pumpkin changes still need live event validation.
+-- Full standalone source; preserves saved preferences and teleport resume.
 local source=[=[
 local Catalog=(function()
 -- Pure catalog helpers. Island membership comes from its quest chain, not World alone.
@@ -283,6 +283,8 @@ function Adapter.new()
         local bridges = require(self.rs.BridgeNet2)
         self.bridge = bridges.ReferenceBridge("ENEMY_EVENT")
         self.generalBridge = bridges.ReferenceBridge("GENERAL_EVENT")
+        self.warnBridge = bridges.ReferenceBridge("WARN_EVENT")
+        self.stormInfo = require(indexer.StormInfo)
         self.dungeonBridge = bridges.ReferenceBridge("DUNGEON_EVENT")
         self.basicInfo = require(indexer.BasicInfos)
         self.balanceInfo = require(indexer.BalanceInfo)
@@ -2879,10 +2881,59 @@ return WorldBoss
 end)()
 
 local Storm=(function()
--- Follow the replicated StormLocation. Do not predict an event from a local timer.
+-- Follow live location state and the native StormAnnounce feed, never a predicted island.
 local Storm={}
 Storm.__index=Storm
 local MODES={"All Monsters","Normal Only","Brutes Only"}
+local function normalize(text)
+    return tostring(text or ""):gsub("<[^>]*>"," "):lower():gsub("[^%w]"," "):gsub("%s+"," "):match("^%s*(.-)%s*$")
+end
+function Storm:now()
+    local stamp=self.adapter.rs:GetAttribute("DateTime")
+    return tonumber(stamp)or workspace:GetServerTimeNow()
+end
+function Storm.mapInText(text,catalog)
+    text=" "..normalize(text).." "
+    local best,length,ambiguous=nil,0,false
+    for key,island in pairs(catalog.byKey)do
+        for _,name in ipairs({key,island.name})do
+            local token=normalize(name)
+            if #token>0 and text:find(" "..token.." ",1,true)then
+                if #token>length then best,length,ambiguous=island,#token,false
+                elseif #token==length and best~=island then ambiguous=true end
+            end
+        end
+    end
+    return not ambiguous and best or nil
+end
+function Storm:announce(message)
+    if not self.alive or type(message)~="table"then return end
+    local text=normalize(message.Message)
+    local typed=message.WType=="StormAnnounce"
+    local ended=text:find("ended",1,true)or text:find("finished",1,true)or text:find("subsided",1,true)
+        or text:find("is over",1,true)or text:find("has stopped",1,true)or text:find("disappeared",1,true)
+    if not typed and not(text:find("storm",1,true)and(text:find("started",1,true)
+        or text:find("begun",1,true)or text:find("appeared",1,true)or ended))then return end
+    if ended then
+        self.announcement=nil getgenv().__SenzyStormAnnouncement=nil self:release()return
+    end
+    if text:find("next storm",1,true)or text:find("will ",1,true)or text:find("starts in",1,true)
+        or text:find("starting in",1,true)or text:find("begins in",1,true)then return end
+    local island
+    for _,field in ipairs({"Map","MapId","Location"})do
+        island=Storm.resolve(message[field],self.app.catalog)
+        if island then break end
+    end
+    island=island or Storm.mapInText(message.Message,self.app.catalog)
+    if not island then return end
+    if self.announcement and self.announcement.key==island.key
+        and self:now()-(self.announcement.received or 0)<5 then return end
+    local duration=tonumber(self.adapter.stormInfo and self.adapter.stormInfo.Duration)or 900
+    self.announcement={jobId=game.JobId,key=island.key,received=self:now(),expires=self:now()+math.max(1,duration)}
+    getgenv().__SenzyStormAnnouncement=self.announcement
+    self:release()self.island=nil self.visited={}self.retryAt=0
+    self.status="Storm detected | "..island.name
+end
 
 function Storm.resolve(location,catalog)
     if type(location)~="string"and type(location)~="number"then return end
@@ -2899,18 +2950,37 @@ end
 function Storm.new(app)
     local self=setmetatable({app=app,adapter=app.adapter,alive=true,enabled=false,mode="All Monsters",
         visited={},nextSearch=0,kills=0,status="Stopped",connections={},eventName="Storm"},Storm)
-    table.insert(self.connections,self.adapter.rs:GetAttributeChangedSignal("StormLocation"):Connect(function()
+    for _,root in ipairs({self.adapter.rs,workspace})do
+    table.insert(self.connections,root:GetAttributeChangedSignal("StormLocation"):Connect(function()
         if not self.alive then return end
+        if self.attributeRoot==root then self.announcement=nil getgenv().__SenzyStormAnnouncement=nil end
         self:release()self.island=nil self.visited={}self.retryAt=0 self.emptySince=nil
     end))
+    end
+    local previous=getgenv().__SenzyStormAnnouncement
+    if type(previous)=="table"and previous.jobId==game.JobId and tonumber(previous.expires)
+        and tonumber(previous.expires)>self:now()then self.announcement=previous end
+    if self.adapter.warnBridge then
+        table.insert(self.connections,self.adapter.warnBridge:Connect(function(message)self:announce(message)end))
+    end
     table.insert(self.connections,self.adapter.player.CharacterAdded:Connect(function()
         self:release()self.app.movement.corrections=0
     end))
     return self
 end
 function Storm:location()
-    local raw=self.adapter.rs:GetAttribute("StormLocation")
-    return Storm.resolve(raw,self.app.catalog),raw
+    for _,root in ipairs({self.adapter.rs,workspace})do
+        local raw=root:GetAttribute("StormLocation")
+        if raw~=nil and raw~=false and raw~=""then
+            self.attributeRoot=root
+            return Storm.resolve(raw,self.app.catalog),raw
+        end
+    end
+    local signal=self.announcement
+    if signal and signal.jobId==game.JobId and tonumber(signal.expires)and tonumber(signal.expires)>self:now()then
+        return Storm.resolve(signal.key,self.app.catalog),signal.key
+    end
+    self.announcement=nil
 end
 function Storm:release()
     self.target=nil self.nextSearch=0 self.emptySince=nil
@@ -2932,7 +3002,7 @@ function Storm:setEnabled(value)
     if value==self.enabled then self:sync()return end
     self:release()self.enabled=value self.island=nil self.visited={}self.retryAt=0
     if value then
-        self.app.movement.corrections=0 self.status="Waiting for Storm"
+        self.app.movement.corrections=0 self.status="Waiting for Storm signal"
     else self.status="Stopped"end
     self:sync()
 end
@@ -2950,9 +3020,15 @@ function Storm:valid(enemy)
     return self.adapter:isTarget(enemy,self.island,self.ids,self.app.catalogModule)
 end
 function Storm:wantsWork()
-    if not self.enabled or self.adapter:blocked()then return false end
-    local island=self:location()
-    if not island or not self.adapter:character()then return false end
+    if not self.enabled then return false end
+    local blocked=self.adapter:blocked()
+    if blocked then self.status=blocked return false end
+    local island,raw=self:location()
+    if not island then
+        self.status=raw and "Storm location is unavailable in this world"or "Waiting for Storm signal"
+        return false
+    end
+    if not self.adapter:character()then self.status="Waiting for your character"return false end
     if island~=self.island then self.island=island self.visited={}self:buildTargets(island)self.retryAt=0 end
     return next(self.ids or {})~=nil and os.clock()>=(self.retryAt or 0)
 end
@@ -2982,7 +3058,7 @@ function Storm:_step(dt)
     local island,raw=self:location()
     if not island then
         self:release()self.island=nil self.visited={}self.retryAt=0 self.emptySince=nil
-        self.status=(raw==nil or raw==false or raw=="")and "Waiting for Storm"or "Storm location is unavailable in this world"
+        self.status=(raw==nil or raw==false or raw=="")and "Waiting for Storm signal"or "Storm location is unavailable in this world"
         return false
     end
     local blocked=adapter:blocked()
@@ -3053,7 +3129,7 @@ function Storm:step(dt)
 end
 function Storm:mount(tab)
     local section=tab:Section({Name="Storm",Side="Right"})
-    local event=section:Label({Text="Storm: Inactive"})
+    local event=section:Label({Text="Storm: Waiting for event signal"})
     local mode,toggle
     mode=section:Dropdown({Name="Targets",Options=MODES,Default="All Monsters",Required=true,
         Callback=function()
@@ -3071,7 +3147,7 @@ function Storm:mount(tab)
         while self.alive and self.app.alive do
             local island,raw=self:location()
             local active=raw~=nil and raw~=false and raw~=""
-            local current=island and "Storm: "..island.name or active and "Storm: Other world / unknown location"or "Storm: Inactive"
+            local current=island and "Storm: "..island.name or active and "Storm: Other world / unknown location"or "Storm: Waiting for event signal"
             if current~=lastEvent then lastEvent=current pcall(event.UpdateName,event,current)end
             local text=self.status.." | Defeated: "..self.kills
             if self.enabled and self.app.eventOwner and self.app.eventOwner~=self then text="Queued after "..self.app.eventOwner.eventName end
@@ -4019,6 +4095,12 @@ local Castle=(function()
 -- Infernal only. Native CastleAction and acknowledged AFK floor progression.
 local Castle={}
 Castle.__index=Castle
+function Castle.remaining(message)
+    if type(message)~="string"then return end
+    local text=message:gsub("<[^>]*>",""):lower()
+    local left,total=text:match("enemies%s+left%s*:%s*(%d+)%s*/%s*(%d+)")
+    return tonumber(left),tonumber(total)
+end
 function Castle:speeds()
     if self.adapter.castleSpeedCatalog then return self.adapter:castleSpeedCatalog()end
     return Adapter.defaultCastleSpeeds()
@@ -4259,7 +4341,10 @@ function Castle:_step(dt,now)
         if floor and floor<self.stopFloor then self.stage="running"self.stoppedFloor=nil self.lastProgress=now
         else self:nativeStep(now,false,true)return true end
     end
-    if floor~=self.lastFloor then self.lastFloor=floor self.seen=false self.emptySince=nil self.combat.target=nil self.lastProgress=now end
+    if floor~=self.lastFloor then
+        self.lastFloor=floor self.floorChangedAt=now self.seen=false self.emptySince=nil
+        self.combat.target=nil self.lastProgress=now self.loadingSince=nil
+    end
     if floor and floor>self.stopFloor then return self:finishAtStop(now,floor)end
     if self.timeLeft and self.timeLeft<=0 then self.blockedCycle=self:cycle()return self:returnMain(now,"Castle timer ended - returning")end
     local alive=0 local observed=false
@@ -4270,6 +4355,23 @@ function Castle:_step(dt,now)
             if self.adapter:enemyAlive(enemy)then alive+=1 end
         end
     end
+    local remaining,total=Castle.remaining(self.adapter.rs:GetAttribute("DungeonMessage"))
+    -- The server can announce a checkpoint before its geometry and enemy parts stream in.
+    -- An empty client list must never mean that a floor with living enemies was cleared.
+    if alive==0 and remaining and remaining>0 then
+        self.emptySince=nil self.loadingSince=self.loadingSince or now self.lastProgress=now
+        self:release()
+        local character,root=self.adapter:character()
+        if character and root and self.adapter.requestArea then
+            self.adapter:requestArea(root.Position,"CastleFloor:"..tostring(floor),now)
+        end
+        if floor and floor>=self.stopFloor then self:nativeStep(now,false,true)
+        else self:nativeStep(now,true)end
+        self.status="Floor "..tostring(floor or "?").." | Loading enemy data: "..remaining
+        return true
+    end
+    self.loadingSince=nil
+    if remaining==0 and total and total>0 and now-(self.floorChangedAt or now)>=2 then observed=true end
     if observed then self.seen=true end
     if alive>0 then self.seen=true self.emptySince=nil
     elseif self.seen then self.emptySince=self.emptySince or now end
@@ -4564,11 +4666,11 @@ function Desert:resetStep(now)
     self.status="Resetting Infinite Desert | Tickets: "..offer.price
     return true
 end
-function Desert:portalPosition()
+function Desert:OTP24HRPosition()
     local world=self.adapter.main:FindFirstChild("__World")local map=world and world:FindFirstChild("InfiniteDesert")
     if not map then return end
     local pos=map:FindFirstChild("Pos")or map
-    for _,name in ipairs({"Portal","EndPortal","PortalBase","PortalEnd"})do
+    for _,name in ipairs({"OTP24HR","EndOTP24HR","OTP24HRBase","OTP24HREnd"})do
         local item=pos:FindFirstChild(name,true)
         if item then
             if item:IsA("BasePart")then return item.Position end
@@ -4580,8 +4682,8 @@ function Desert:valid(enemy)
     return self:inside()and self.adapter:enemyAlive(enemy)and enemy:GetAttribute("Shield")~=true
 end
 function Desert:selectEnemy(root)
-    local anchor=self.priority=="Closest to Portal"and self:portalPosition()or root.Position
-    self.portalMissing=anchor==nil anchor=anchor or root.Position
+    local anchor=self.priority=="Closest to OTP24HR"and self:OTP24HRPosition()or root.Position
+    self.OTP24HRMissing=anchor==nil anchor=anchor or root.Position
     local best,distance,key=nil,math.huge,nil
     for _,enemy in ipairs(self.adapter:enemyList())do
         if self:valid(enemy)then
@@ -4652,7 +4754,7 @@ function Desert:_step(dt,now)
     if not self.farmEnabled or not self:valid(target)then return true end
     if self.app.clickEnabled then self.adapter:instanceClick(target,root,now)
     else self.adapter:attack(target,root,now)end
-    self.status="Wave "..wave.." | Enemies: "..count..(self.portalMissing and " | Using nearest enemy"or "")
+    self.status="Wave "..wave.." | Enemies: "..count..(self.OTP24HRMissing and " | Using nearest enemy"or "")
     return true
 end
 function Desert:step(dt)
@@ -4663,7 +4765,7 @@ function Desert:step(dt)
 end
 function Desert:mount(tab)
     local section=tab:Section({Name="Infinite Desert",Side="Left"})
-    local waveLabel=section:Label({Text="Wave: - | Portal: -"})
+    local waveLabel=section:Label({Text="Wave: - | OTP24HR: -"})
     local join,farm,replay,start,priority,speed
     join=section:Toggle({Name="Auto Join Infinite Desert",Default=false,Callback=function(v)if not self.syncing then self:setFlag("joinEnabled",v)end end},"SenzyDesertJoin")
     farm=section:Toggle({Name="Auto Farm Infinite Desert",Default=false,Callback=function(v)if not self.syncing then self:setFlag("farmEnabled",v)end end},"SenzyDesertFarm")
@@ -4673,7 +4775,7 @@ function Desert:mount(tab)
     local _,_,maximum=self:maximum()
     local limit=section:Slider({Name="Stop At Wave",Minimum=1,Maximum=maximum,Default=maximum,Precision=0,Callback=function(v)self.stopWave=math.clamp(math.floor(tonumber(v)or maximum),1,maximum)end},"SenzyDesertStop")
     local leave=section:Toggle({Name="Leave At Stop Wave",Default=true,Callback=function(v)self.leaveAtStop=v==true end},"SenzyDesertLeave")
-    priority=section:Dropdown({Name="Target Priority",Options={"Nearest","Highest HP","Closest to Portal"},Default="Nearest",Required=true,Callback=function()if priority then self.priority=selected(priority)or "Nearest"end end},"SenzyDesertPriority")
+    priority=section:Dropdown({Name="Target Priority",Options={"Nearest","Highest HP","Closest to OTP24HR"},Default="Nearest",Required=true,Callback=function()if priority then self.priority=selected(priority)or "Nearest"end end},"SenzyDesertPriority")
     local _,speedNames=self.adapter:desertSpeedCatalog()
     speed=section:Dropdown({Name="Desert Speed",Options=speedNames,Default=speedNames[1],Required=true,Callback=function()if speed then self.speed=selected(speed)or speedNames[1]self.speedAttempts=0 self.nextSpeed=0 end end},"SenzyDesertSpeed")
     section:Button({Name="Return To Main World",Callback=function()
@@ -4691,7 +4793,7 @@ function Desert:mount(tab)
                 start:ClearOptions()start:InsertOptions(options)start:UpdateSelection({self.startChoice})
             end
             local text="Wave: "..tostring(self.adapter.rs:GetAttribute("CurrentWave")or "-").." | Best: "..best
-                .." | Portal: "..tostring(self.adapter.rs:GetAttribute("PortalHealth")or "-")
+                .." | OTP24HR: "..tostring(self.adapter.rs:GetAttribute("OTP24HRHealth")or "-")
             if text~=lastWave then lastWave=text pcall(waveLabel.UpdateName,waveLabel,text)end
             if self.status~=last then last=self.status pcall(status.UpdateName,status,self.status)end
             task.wait(.5)
@@ -5097,8 +5199,8 @@ local Dash = (function()
     return Dash
 end)()
 
-local Pumpkins = (function()
-    local Pumpkins = {}
+local Pumpkins=(function()
+local Pumpkins = {}
     Pumpkins.__index = Pumpkins
     local ROUTES = {"Nearest", "Storm First"}
 
@@ -5112,9 +5214,9 @@ local Pumpkins = (function()
             confirmed = setmetatable({}, {__mode = "k"}),
         }, Pumpkins)
         table.insert(self.connections, self.adapter.generalBridge:Connect(function(message)
-            if self.alive and type(message) == "table" and message.Event == "PumpkinDisable"
-                and typeof(message.Pumpkin) == "Instance" then
-                self:confirm(message.Pumpkin)
+            if self.alive and type(message) == "table" and message.Event == "PumpkinDisable" then
+                local pumpkin = self:pickupModel(message.Pumpkin)
+                if pumpkin then self:confirm(pumpkin) end
             end
         end))
         return self
@@ -5123,6 +5225,14 @@ local Pumpkins = (function()
     function Pumpkins:folder()
         local extra = workspace:FindFirstChild("__Extra")
         return extra and extra:FindFirstChild("__Pumps")
+    end
+
+    function Pumpkins:pickupModel(value)
+        if type(value) == "table" then value = value.Part or value.Main end
+        if typeof(value) ~= "Instance" then return end
+        local folder = self:folder()
+        while value and value.Parent and value.Parent ~= folder do value = value.Parent end
+        if value and value.Parent == folder then return value end
     end
 
     function Pumpkins:confirm(pumpkin)
@@ -5179,7 +5289,7 @@ local Pumpkins = (function()
         self.visible = 0
         if not folder or not root then self.target = nil return end
         self.adapter:cacheSpawns()
-        local storm = Storm.resolve(self.adapter.rs:GetAttribute("StormLocation"), self.app.catalog)
+        local storm = self.app.storm and self.app.storm:location()
         local best, bestScore
         for _, pumpkin in ipairs(folder:GetChildren()) do
             if self:available(pumpkin, now) then
@@ -5200,6 +5310,10 @@ local Pumpkins = (function()
     function Pumpkins:wantsWork()
         if not self.enabled or self.adapter:blocked() or not self.adapter:character() then return false end
         self:scan(os.clock())
+        if not self.target then
+            self.status = workspace:GetAttribute("HalloweenNight") == true
+                and "Waiting for spawned pumpkins" or "Waiting for Halloween Night / spawned pumpkins"
+        end
         return self.target ~= nil and self:available(self.target, os.clock())
     end
 
@@ -5232,9 +5346,11 @@ local Pumpkins = (function()
             self.attempts[pumpkin] = attempt
         end
         if attempt.retryAt then
-            attempt.retryAt = nil attempt.started = now attempt.sent = 0
+            attempt.retryAt = nil attempt.started = now attempt.sent = 0 attempt.arrivedAt = nil
         end
-        if now - attempt.started > 15 or attempt.sent >= 3 and now >= attempt.nextTry then
+        if not attempt.arrivedAt and now - attempt.started > 60
+            or attempt.arrivedAt and now - attempt.arrivedAt > 15
+            or attempt.sent >= 3 and now >= attempt.nextTry then
             attempt.retryAt = now + 30
             self.target = nil self.nextScan = 0 self:release()
             self.status = "Pickup unconfirmed - skipping and retrying later"
@@ -5261,6 +5377,7 @@ local Pumpkins = (function()
         if not arrived then return true end
         if app.shadowFollow and not app.shadowFollow:afterMove(true, now) then return true end
         if not self.enabled or not self:available(pumpkin, now) then return false end
+        attempt.arrivedAt = attempt.arrivedAt or now
         if now < attempt.nextTry or now < self.nextCollect then
             self.status = "Waiting for pumpkin collection confirmation"
             return true
@@ -6005,7 +6122,7 @@ function Config:restore()
             ds.stopWave=math.floor(number(dc.limit,maximum,1,maximum))ds.leaveAtStop=dc.leave~=false
             local _,speedOptions=ds.adapter:desertSpeedCatalog()
             ds.speed=option(dc.speed,speedOptions,speedOptions[1])
-            ds.priority=option(dc.priority,{"Nearest","Highest HP","Closest to Portal"},"Nearest")
+            ds.priority=option(dc.priority,{"Nearest","Highest HP","Closest to OTP24HR"},"Nearest")
             dropdown(ds.Controls.Start,{ds.startChoice})ds.Controls.Limit:UpdateValue(ds.stopWave)
             toggle(ds.Controls.Leave,ds.leaveAtStop)dropdown(ds.Controls.Speed,{ds.speed})dropdown(ds.Controls.Priority,{ds.priority})
             local otherMode=resumeHunter or resumeDungeon or h.enabled or m.enabled or r.enabled
