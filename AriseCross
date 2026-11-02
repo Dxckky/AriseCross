@@ -1,4 +1,5 @@
 -- ARISE 1.0 | senzy hub | by prxwqay
+-- Event fixes v1.1: independent event queue, empty-raid detection, Arena-only boss travel.
 -- Self-contained senzy hub. Saved preferences and toggle states restore automatically.
 -- Small executor files store the loader and automation settings for teleport resume.
 local source=[=[
@@ -150,7 +151,7 @@ function Catalog.compareHealthKeys(a,b)
 end
 function Catalog.matches(island,selected,attrs)
     if type(island)~="table"or type(attrs)~="table"then return false end
-    local id=attrs.Id
+    local id=attrs.Id or attrs.ID
     local chosen=type(selected)=="table"and selected[id]==true or type(selected)=="string"and selected==id
     if not chosen or not island.ids[id]or tostring(attrs.MapId)~=island.mapId
         or attrs.Dead==true or attrs.Shield==true then return false end
@@ -325,6 +326,9 @@ function Adapter.new()
     self.floorParams.FilterDescendantsInstances = floorRoots
     self.world = tonumber(self.rs:GetAttribute("World")) or tonumber(getgenv().__SenzyDungeonWorld) or 1
     self.range, self.interval, self.nextStats = 30, 0.45, 0
+    self.deadEnemies=setmetatable({},{__mode="k"})
+    self.eventStateConnection=self.bridge:Connect(function(message)self:onEnemyEvent(message)end)
+    self:cacheSpawns()
     return self
 end
 
@@ -469,17 +473,29 @@ function Adapter:refreshStats(now)
 end
 
 -- Instanced enemies retain their spawn attributes; live health and death are in EnemyLocal.
-function Adapter:enemyHP(enemy)
-    if self.enemyLocal then return self.enemyLocal.HP(enemy)end
-    return enemy:GetAttribute("HP")
+function Adapter:onEnemyEvent(message)
+    if type(message)~="table"then return end
+    local key=message.Enemy or message.EnemyId
+    local enemy=key and self.enemies:FindFirstChild(tostring(key))
+    if not enemy then return end
+    if message.Event=="EnemyDeath"then self.deadEnemies[enemy]=true
+    elseif message.Event=="RespawnEnemy"then self.deadEnemies[enemy]=nil end
 end
+function Adapter:enemyHP(enemy)
+    return self:enemyAttributes(enemy).HP
+end
+
 function Adapter:enemyAttributes(enemy)
     local attrs=enemy:GetAttributes()
+    attrs.Id=attrs.Id or attrs.ID
     if self.enemyLocal then
-        attrs.HP=self.enemyLocal.HP(enemy)
-        attrs.Dead=self.enemyLocal.Dead(enemy)
+        local hp=self.enemyLocal.HP and self.enemyLocal.HP(enemy)
+        local dead=self.enemyLocal.Dead and self.enemyLocal.Dead(enemy)
+        if hp~=nil then attrs.HP=hp end
+        if dead~=nil then attrs.Dead=dead end
         if self.enemyLocal.Arised then attrs.Arised=self.enemyLocal.Arised(enemy)end
     end
+    if self.deadEnemies and self.deadEnemies[enemy]then attrs.Dead=true attrs.HP=0 end
     return attrs
 end
 function Adapter:enemyAlive(enemy)
@@ -563,6 +579,7 @@ function Adapter:groundAt(position, rise, drop)
 end
 
 function Adapter:targetPosition(enemy, character, root, humanoid, now)
+    if not enemy or not enemy.Parent or not enemy:IsA("BasePart")then return nil end
     if enemy and enemy.Parent==self.enemies and enemy:IsA("BasePart")then return enemy.Position end
     local cache = self.floorCache
     if cache and cache.enemy == enemy and cache.character == character and now < cache.expires
@@ -576,12 +593,31 @@ function Adapter:targetPosition(enemy, character, root, humanoid, now)
     return goal
 end
 
+function Adapter:cacheSpawns()
+    self.spawnCache=self.spawnCache or {}
+    local extra=workspace:FindFirstChild("__Extra")
+    self.spawns=extra and extra:FindFirstChild("__Spawns")or self.spawns
+    if not self.spawns or not self.spawns.Parent then return end
+    for _,spawn in ipairs(self.spawns:GetChildren())do
+        if spawn:IsA("BasePart")then
+            self.spawnCache[spawn.Name]={position=spawn.Position,height=spawn.Size.Y*.5}
+        end
+    end
+end
 function Adapter:spawnPosition(island, character, root, humanoid)
-    local spawn = self.spawns and self.spawns:FindFirstChild(island.key)
-    if not spawn or not spawn:IsA("BasePart") then return nil end
-    local floor = self:groundAt(spawn.Position)
-    local surfaceY = floor and floor.Y or spawn.Position.Y + spawn.Size.Y * 0.5
-    return Vector3.new(spawn.Position.X, surfaceY + self:standingHeight(character, root, humanoid), spawn.Position.Z)
+    local now=os.clock()
+    if now>=(self.nextSpawnCache or 0)then self.nextSpawnCache=now+2 self:cacheSpawns()end
+    local spawn=self.spawns and self.spawns:FindFirstChild(island.key)
+    local cached=self.spawnCache and self.spawnCache[island.key]
+    if spawn and spawn:IsA("BasePart")then
+        cached={position=spawn.Position,height=spawn.Size.Y*.5}
+        self.spawnCache=self.spawnCache or {} self.spawnCache[island.key]=cached
+    end
+    if not cached then return nil end
+    local position=cached.position
+    local floor=self:groundAt(position)
+    local surfaceY=floor and floor.Y or position.Y+cached.height
+    return Vector3.new(position.X,surfaceY+self:standingHeight(character,root,humanoid),position.Z)
 end
 
 function Adapter:requestArea(position,key,now)
@@ -1012,28 +1048,60 @@ function Controller:clickStep(now)
 end
 
 function Controller:eventStep(dt)
-    local workers={}
-    for _,name in ipairs({"raid","worldBoss","storm"})do if self[name]then table.insert(workers,self[name])end end
-    local function ready(worker)
-        if not worker or worker.alive==false then return false end
-        local ok,value=pcall(worker.wantsWork,worker)
-        if not ok then
-            worker:setEnabled(false)worker.status="Event stopped: "..tostring(value)
-            warn("[senzy hub] "..worker.status)return false
+    local now=os.clock()
+    local workers,ready={},{ }
+    for _,name in ipairs({"raid","worldBoss","storm"})do
+        if self[name]then table.insert(workers,self[name])end
+    end
+    for _,worker in ipairs(workers)do
+        if worker.alive~=false then
+            local ok,value=pcall(worker.wantsWork,worker)
+            if not ok then
+                worker:setEnabled(false)worker.status="Event stopped: "..tostring(value)
+                warn("[senzy hub] "..worker.status)
+            else ready[worker]=value==true end
         end
-        return value==true
+    end
+    local function release(owner)
+        self.eventOwner=nil self.eventOwnerSince=nil
+        owner:release()
+        -- Each lease starts with an independent correction budget; warp pacing stays shared.
+        self.movement.corrections=0
     end
     local owner=self.eventOwner
-    if owner and not ready(owner)then owner:release()self.eventOwner=nil owner=nil end
-    if not owner then
-        for _,worker in ipairs(workers)do
-            if ready(worker)then owner=worker self.eventOwner=worker break end
+    if owner and not ready[owner]then release(owner)owner=nil end
+    if owner then
+        local alternative=false
+        for _,worker in ipairs(workers)do if worker~=owner and ready[worker]then alternative=true break end end
+        local age=now-(self.eventOwnerSince or now)
+        local fighting=owner.target and self.adapter:enemyAlive(owner.target)
+        local looting=owner.corpses and next(owner.corpses)~=nil
+        if alternative and(age>=90 or age>=60 and not fighting and not looting)then
+            release(owner)owner=nil
         end
     end
-    if not owner then return false end
-    local handled=owner:step(dt)
-    if not handled then owner:release()self.eventOwner=nil end
-    return handled==true
+    -- A finished/unavailable worker can hand off in this same heartbeat.
+    for _=1,#workers do
+        if not owner then
+            local start=self.eventCursor or 0
+            for offset=1,#workers do
+                local index=(start+offset-1)%#workers+1
+                if ready[workers[index]]then
+                    owner=workers[index]self.eventCursor=index
+                    self.eventOwner=owner self.eventOwnerSince=now break
+                end
+            end
+        end
+        if not owner then return false end
+        local ok,handled=pcall(owner.step,owner,dt)
+        if not ok then
+            owner:setEnabled(false)owner.status="Event stopped: "..tostring(handled)
+            warn("[senzy hub] "..owner.status)
+        end
+        if ok and handled==true then return true end
+        ready[owner]=false release(owner)owner=nil
+    end
+    return false
 end
 
 function Controller:step(dt)
@@ -1200,6 +1268,7 @@ function Controller:Destroy()
     self:invalidate()
     for _,connection in ipairs(self.connections) do connection:Disconnect() end
     table.clear(self.connections)
+    if self.adapter.eventStateConnection then self.adapter.eventStateConnection:Disconnect()self.adapter.eventStateConnection=nil end
     if self.window then
         if type(setthreadidentity)=="function"then setthreadidentity(self.uiIdentity or 8)end
         self.window:Unload()
@@ -1998,20 +2067,30 @@ function Raid:state()
     local open,left,cycle=Raid.window(self:serverNow(),self.adapter.balanceInfo.JejuIsland)
     if cycle~=self.windowCycle then
         self.windowCycle=cycle self.streamRequested=false self.stateNext=0
+        self.emptySince=nil self.probeStarted=nil self.retryAt=0 self.clearedCycle=nil
+        self.seenLiving=false self.returnCycle=nil self.returning=false self.active=false
+        self.target=nil self.nextScan=0 table.clear(self.corpses)table.clear(self.records)
         table.clear(self.retired)table.clear(self.availabilityRetired)
     end
     local count=self.loadedCount or 0
+    local attackable=self.loadedAttackable or 0
     if os.clock()>=(self.stateNext or 0)then
-        self.stateNext=os.clock()+.25 count=0
+        self.stateNext=os.clock()+.25 count=0 attackable=0
         for _,enemy in ipairs(self.adapter.enemies:GetChildren())do
             if enemy:IsA("BasePart")and not self.availabilityRetired[enemy]then
                 local attrs=self.adapter:enemyAttributes(enemy)
-                if Raid.isRaidInfo(attrs)and attrs.Dead~=true and Catalog.healthKey(attrs.HP)then count+=1 end
+                if Raid.isRaidInfo(attrs)and attrs.Dead~=true and Catalog.healthKey(attrs.HP)then
+                    count+=1 if attrs.Shield~=true then attackable+=1 end
+                end
             end
         end
-        self.loadedCount=count
+        self.loadedCount=count self.loadedAttackable=attackable
     end
-    return self.finishedCycle~=cycle and(open or count>0),count,left,cycle
+    if count>0 and self.finishedCycle~=cycle then
+        self.clearedCycle=nil self.emptySince=nil self.seenLiving=true
+        if attackable>0 then self.retryAt=0 end
+    end
+    return self.finishedCycle~=cycle and(count>0 or open and self.clearedCycle~=cycle),count,left,cycle
 end
 
 function Raid.isRaidInfo(info)
@@ -2046,6 +2125,7 @@ function Raid.new(app)
     return self
 end
 function Raid:release()
+    self.emptySince=nil self.probeStarted=nil
     if self.owns then self.app:invalidate()self.owns=false end
     self:restoreLootControl()
 end
@@ -2073,7 +2153,7 @@ function Raid:setEnabled(value)
     self:release()
     self.enabled=value self.target=nil self.nextScan=0
     table.clear(self.corpses)table.clear(self.records)table.clear(self.retired)
-    self.active=false self.returning=false self.finishAt=nil
+    self.active=false self.returning=false self.finishAt=nil self.retryAt=0 self.probeStarted=nil self.emptySince=nil
     if value then
         if self.app.desert then self.app.desert:stop("Raid selected")end
         if self.app.castle then self.app.castle:stop("Raid selected")end
@@ -2094,8 +2174,10 @@ end
 function Raid:onEvent(message)
     local now=os.clock()
     if message.Event=="JejuFinish" then
+        local _,_,cycle=Raid.window(self:serverNow(),self.adapter.balanceInfo.JejuIsland)
+        self.finishedCycle=cycle
         local participated=self.active or self.owns
-        if self.active then self.rounds+=1 end
+        if self.active and self.countedCycle~=cycle then self.rounds+=1 self.countedCycle=cycle end
         self.active=false self.target=nil self.finishAt=now
         self.returning=participated and self.returnAfter and self.returnPosition~=nil
         for _,enemy in ipairs(self.adapter.enemies:GetChildren())do
@@ -2106,7 +2188,10 @@ function Raid:onEvent(message)
     end
     local key=tostring(message.Enemy or message.EnemyId or "")
     local record=self.records[key]
-    if message.Event=="EnemyDeath" and record and not record.dead then
+    if message.Event=="RespawnEnemy"then
+        if record then record.dead=false self.retired[record.instance]=nil self.availabilityRetired[record.instance]=nil end
+        self.stateNext=0 self.nextScan=0
+    elseif message.Event=="EnemyDeath" and record and not record.dead then
         record.dead=true self.kills+=1
     elseif message.Event=="EnemyArise" and message.CanArise==true and record and self.afterDefeat~="Ignore" then
         local chances=tonumber(message.Chances) or 3
@@ -2140,7 +2225,7 @@ function Raid:validEnemy(enemy)
     if self.finishedCycle~=nil and self.finishedCycle==self.windowCycle then return false end
     if not enemy or enemy.Parent~=self.adapter.enemies or not enemy:IsA("BasePart")or self.retired[enemy]then return false end
     local a=self.adapter:enemyAttributes(enemy)
-    return Raid.isRaidInfo(a)and a.Dead~=true and a.Shield~=true and (tonumber(a.HP)or 0)>0
+    return Raid.isRaidInfo(a)and a.Dead~=true and a.Shield~=true and Catalog.healthKey(a.HP)~=nil
 end
 function Raid:scan(root,now)
     if now<self.nextScan then return end
@@ -2163,7 +2248,10 @@ function Raid:scan(root,now)
         end
     end
     for name,r in pairs(self.records)do if not r.instance.Parent and now-r.lastSeen>20 and not self.corpses[name]then self.records[name]=nil end end
-    if self.target and not self.adapter:enemyAlive(self.target)then self.target=nil self.app.movement:waitAfterEnemy(now)end
+    if self.target and not self:validEnemy(self.target)then
+        if not self.adapter:enemyAlive(self.target)then self.app.movement:waitAfterEnemy(now)end
+        self.target=nil
+    end
     if best and not self.target then
         self.target=best self.app.movement:stop()
     end
@@ -2188,13 +2276,14 @@ end
 function Raid:loot(character,root,humanoid,dt,now)
     local chosen
     for key,c in pairs(self.corpses)do
-        if now>=c.expires or self.afterDefeat=="Ignore"then self.corpses[key]=nil
+        if now>=c.expires or self.afterDefeat=="Ignore"or typeof(c.position)~="Vector3"then self.corpses[key]=nil
         elseif not chosen or c.expires<chosen.expires then chosen=c end
     end
     if not chosen then return false end
     local c=chosen
     local distance=(root.Position-c.position).Magnitude
-    self.status="Collecting "..(self.adapter.enemyInfo[c.id].Name or c.id)
+    local info=self.adapter.enemyInfo[c.id]
+    self.status="Collecting "..(info and info.Name or c.id)
     if distance>18 then
         local floor=self.adapter:groundAt(c.position)
         local goal=floor and Vector3.new(c.position.X,floor.Y+self.adapter:standingHeight(character,root,humanoid),c.position.Z)
@@ -2211,7 +2300,8 @@ function Raid:loot(character,root,humanoid,dt,now)
         local stats=self.adapter:getStats()
         local inv=stats and stats:FindFirstChild("Inventory")
         local pets=inv and inv:FindFirstChild("Pets")
-        if not ok or not pets or #pets:GetChildren()>=capacity then
+        capacity=tonumber(capacity)
+        if not ok or not capacity or not pets or #pets:GetChildren()>=capacity then
             self.corpses[c.enemy]=nil self.status="Shadow inventory full"return true
         end
     end
@@ -2231,14 +2321,17 @@ function Raid:_step(dt)
     local character,root,humanoid=self.adapter:character()
     if not character then self.app.movement:stop()self.status="Waiting for character"return true end
     local now=os.clock()
-    local open,_,_,cycle=self:state()
+    local open,count,_,cycle=self:state()
     if not open and not self.active and not self.returning and next(self.corpses)==nil then self:release()self.status="Waiting for Dedu Raid"return false end
     if not self.owns then
-        self.app:invalidate()self.owns=true self.returnPosition=root.Position self:takeLootControl()
+        self.app:invalidate()self.owns=true self:takeLootControl()
+        if self.returnCycle~=cycle then self.returnCycle=cycle self.returnPosition=root.Position end
+        self.probeStarted=now
     end
     if not open and self.active then self:onEvent({Event="JejuFinish"})end
-    if self.target and not self.adapter:enemyAlive(self.target)then
-        self.target=nil self.app.movement:stop()self.app.movement:waitAfterEnemy(now)
+    if self.target and not self:validEnemy(self.target)then
+        if not self.adapter:enemyAlive(self.target)then self.app.movement:waitAfterEnemy(now)end
+        self.target=nil self.app.movement:stop()
     end
     if not self.target and self:loot(character,root,humanoid,dt,now)then return true end
     if not self.target and self.app.movement:waitingForEnemy(now)then
@@ -2247,6 +2340,7 @@ function Raid:_step(dt)
     self:scan(root,now)
     local target=self.target
     if target then
+        self.probeStarted=nil self.emptySince=nil
         if not self:validEnemy(target)then self.app.movement:stop()self.status="Waiting for the current target"return true end
         local goal=self.adapter:targetPosition(target,character,root,humanoid,now)
         if not goal then goal=self.adapter:spawnPosition({key="JejuEvent"},character,root,humanoid)end
@@ -2256,45 +2350,76 @@ function Raid:_step(dt)
         end
         if not self.enabled or not self:validEnemy(target)then return true end
         local id=tostring(target:GetAttribute("Id")or target:GetAttribute("ID"))
-        self.status=(self.adapter.enemyInfo[id].Name or id).." | HP: "..tostring(self.adapter:enemyHP(target))
+        local info=self.adapter.enemyInfo[id]
+        self.status=(info and info.Name or id).." | HP: "..tostring(self.adapter:enemyHP(target))
         self.adapter:attack(target,root,now)
         return true
     end
     if self.returning and self.returnPosition then
+        -- Other enabled events take precedence over an optional return trip.
+        local queued=false
+        for _,name in ipairs({"worldBoss","storm"})do
+            local worker=self.app[name]
+            if worker and worker.enabled then local ok,wants=pcall(worker.wantsWork,worker)if ok and wants then queued=true break end end
+        end
+        if queued or now-(self.finishAt or now)>=8 then
+            self.returning=false self:release()return false
+        end
         local floor=self.adapter:groundAt(self.returnPosition,4,256)
-        local goal=floor and floor+Vector3.new(0,self.adapter:standingHeight(character,root,humanoid),0)
+        local goal=floor and floor+Vector3.new(0,self.adapter:standingHeight(character,root,humanoid),0)or self.returnPosition
         self.status="Returning"
         if self:move(character,root,humanoid,goal,self.returnPosition,"RaidReturn",dt,now)then
-            self.returning=false self.app.movement:stop()
+            self.returning=false self:release()return false
         end
         return true
     end
     if open then
         local goal=self.adapter:spawnPosition({key="JejuEvent"},character,root,humanoid)
-        if not goal then self.app.movement:stop()self.status="Dedu is open - island spawn is unavailable"return true end
-        if not self.streamRequested then
-            self.streamRequested=true
-            local player=self.adapter.player
-            task.spawn(function()pcall(function()player:RequestStreamAroundAsync(goal,3)end)end)
+        self.probeStarted=self.probeStarted or now
+        if goal then
+            self.adapter:requestArea(goal,"Dedu:"..tostring(cycle),now)
+            if(root.Position-goal).Magnitude>100 then
+                self.emptySince=nil self.status="Dedu is open - moving to island"
+                self:move(character,root,humanoid,goal,goal,"DeduEntry:"..tostring(cycle),dt,now)
+            else
+                self.app.movement:stop()self.status="Checking Dedu enemies"
+                if count==0 then
+                    self.emptySince=self.emptySince or now
+                    if now-self.emptySince>=8 and self.seenLiving then
+                        -- Soft completion: a later live wave can wake this worker again.
+                        self.clearedCycle=cycle self.active=false self.finishAt=now
+                        if self.countedCycle~=cycle then self.rounds+=1 self.countedCycle=cycle end
+                        self.returning=self.returnAfter and self.returnPosition~=nil
+                        self.status="Dedu cleared - yielding to other events"
+                        self:release()return false
+                    end
+                else self.emptySince=nil end
+            end
+        else self.status="Waiting for Dedu spawn position"end
+        if now-self.probeStarted>=20 then
+            self.retryAt=now+30 self.active=false self:release()
+            self.status="Dedu has no available targets - retrying later"return false
         end
-        if(root.Position-goal).Magnitude>100 then
-            self.status="Dedu is open - moving to island"
-            self:move(character,root,humanoid,goal,goal,"DeduEntry:"..tostring(cycle),dt,now)
-        else self.app.movement:stop()self.status="Dedu is open - waiting for enemies to load"end
         return true
     end
-    self.app.movement:stop()
-    self.status=self.active and "Waiting for next wave"or "Waiting for Dedu Raid"
-    return true
+    self:release()self.status="Waiting for Dedu Raid"return false
 end
+
 function Raid:wantsWork()
     if not self.enabled or not WORLD1[game.PlaceId]or self.adapter:blocked()then return false end
     local r=self.adapter.rs
     if r:GetAttribute("Dungeon")==true or r:GetAttribute("IsCastle")==true or r:GetAttribute("InInfinite")==true
         or r:GetAttribute("HLRaid")==true or not self.adapter:character()then return false end
-    local open=self:state()
+    local now=os.clock()
+    local open,count=self:state()
+    for key,c in pairs(self.corpses)do
+        if now>=c.expires or self.afterDefeat=="Ignore"or typeof(c.position)~="Vector3"then self.corpses[key]=nil end
+    end
+    if self.returning and now-(self.finishAt or now)>=8 then self.returning=false end
+    if (self.loadedAttackable or 0)==0 and now<(self.retryAt or 0)then return next(self.corpses)~=nil end
     return open or self.active==true or self.returning==true or next(self.corpses)~=nil
 end
+
 function Raid:step(dt)
     if not self.alive then return false end
     local ok,result=pcall(self._step,self,dt)
@@ -2312,7 +2437,7 @@ function Raid:availability()
         or self.adapter.rs:GetAttribute("IsCastle")==true or self.adapter.rs:GetAttribute("InInfinite")==true then return "Raid: Unavailable in this world" end
     local open,count,left,cycle=self:state()
     if open then return count>0 and "Raid: Active | Enemies: "..count or "Raid: Open | Enemies not loaded"end
-    if self.finishedCycle==cycle then return "Raid: Ended | Waiting for next round"end
+    if self.finishedCycle==cycle or self.clearedCycle==cycle then return "Raid: Cleared | Waiting for new enemies / next round"end
     return "Raid: Not started | Opens in "..math.ceil(left).."s"
 end
 function Raid:mount(group)
@@ -2383,8 +2508,8 @@ function WorldBoss.catalog(adapter)
             local key=boss.Boss.."@"..boss.Map
             if type(map)=="table"and type(info)=="table"and tonumber(map.World)==tonumber(adapter.world)
                 and not byKey[key]then
-                local entry={key=key,id=boss.Boss,map=boss.Map,mapId=tostring(map.Order),
-                    name=info.Name or boss.Boss,island=map.Name or boss.Map,order=tonumber(map.Order)or math.huge}
+                local entry={key=key,id=boss.Boss,map="Arena",sourceMap=boss.Map,mapId=tostring(map.Order),
+                    name=info.Name or boss.Boss,island="World Arena",order=tonumber(map.Order)or math.huge}
                 entry.label=entry.name.." | "..entry.island
                 byKey[key]=entry table.insert(entries,entry)
             end
@@ -2396,7 +2521,7 @@ function WorldBoss.catalog(adapter)
         return a.key<b.key
     end)
     for _,entry in ipairs(entries)do
-        if byLabel[entry.label]then entry.label=entry.label.." ["..entry.id.."]"end
+        if byLabel[entry.label]then entry.label=entry.label.." ["..entry.key.."]"end
         byLabel[entry.label]=entry
     end
     return entries,byKey,byLabel
@@ -2429,13 +2554,13 @@ end
 
 function WorldBoss:entryFor(enemy,selectedOnly)
     if not enemy or enemy.Parent~=self.adapter.enemies or not enemy:IsA("BasePart")then return end
-    local id,map=enemy:GetAttribute("Id"),tostring(enemy:GetAttribute("MapId"))
+    local id=enemy:GetAttribute("Id")or enemy:GetAttribute("ID")
     for _,entry in ipairs(self.entries)do
-        if id==entry.id and map==entry.mapId and(not selectedOnly or self.selected[entry.key])then return entry end
+        if id==entry.id and(not selectedOnly or self.selected[entry.key])then return entry end
     end
 end
 function WorldBoss:valid(enemy)
-    return self:entryFor(enemy,true)~=nil and not self.retired[enemy]
+    return (self.finishedCycle==nil or self.finishedCycle~=self.checkCycle)and self:entryFor(enemy,true)~=nil and not self.retired[enemy]
         and self.adapter:enemyAlive(enemy)and enemy:GetAttribute("Shield")~=true
 end
 function WorldBoss:release()
@@ -2466,21 +2591,15 @@ function WorldBoss:setEnabled(value)
     self:sync()return self.enabled
 end
 function WorldBoss:nextIsland(character,root,humanoid,now)
-    if type(self.adapter.spawnPosition)~="function"then return end
-    local best,distance,seen=nil,math.huge,{}
-    for _,entry in ipairs(self.entries)do
-        if self.selected[entry.key]and not self.defeated[entry.key]and not seen[entry.map]
-            and now>=(self.checkedMaps[entry.map]or 0)then
-            seen[entry.map]=true
-            local goal=self.adapter:spawnPosition({key=entry.map},character,root,humanoid)
-            if goal then
-                local d=(root.Position-goal).Magnitude
-                if d<distance then best,distance={map=entry.map,island=entry.island,goal=goal},d end
-            end
-        end
-    end
-    return best
+    if type(self.adapter.spawnPosition)~="function"or now<(self.checkedMaps.Arena or 0)then return end
+    local pending=false
+    for key in pairs(self.selected)do if not self.defeated[key]then pending=true break end end
+    if not pending then return end
+    local goal=self.adapter:spawnPosition({key="Arena"},character,root,humanoid)
+    if goal then return {map="Arena",island="World Arena",goal=goal}end
+    self.status="Waiting for World Arena spawn position"
 end
+
 function WorldBoss:wantsWork()
     if not self.enabled or next(self.selected)==nil or self.adapter:blocked()then return false end
     local character,root,humanoid=self.adapter:character()
@@ -2495,7 +2614,6 @@ function WorldBoss:wantsWork()
 end
 function WorldBoss:claim()
     if self.owns then return end
-    if self.app.storm then self.app.storm:release()end
     self.app:invalidate()self.owns=true
 end
 function WorldBoss:move(character,root,humanoid,goal,look,key,dt,now)
@@ -2519,15 +2637,20 @@ function WorldBoss:scoutStep(character,root,humanoid,dt,now)
     if not open then self.scout=nil return false end
     local scout=self.scout or self:nextIsland(character,root,humanoid,now)
     if not scout then return false end
-    self.scout=scout self:claim()
+    self.scout=scout scout.startedAt=scout.startedAt or now self:claim()
     if self.adapter.requestArea then self.adapter:requestArea(scout.goal,"Boss:"..scout.map,now)end
     self.status="Checking World Boss | "..scout.island
     local key="BossScout:"..self.checkCycle..":"..scout.map
+    if now-scout.startedAt>=20 then
+        self.checkedMaps.Arena=now+30 self.scout=nil self:release()
+        self.status="World Arena unavailable - retrying later"return false
+    end
     if not self:move(character,root,humanoid,scout.goal,scout.goal,key,dt,now)then return true end
     scout.arrivedAt=scout.arrivedAt or now
     self.status="Loading World Boss | "..scout.island
-    if now-scout.arrivedAt>=5 then
-        self.checkedMaps[scout.map]=now+30 self.scout=nil
+    if now-scout.arrivedAt>=8 then
+        self.checkedMaps.Arena=now+30 self.scout=nil self:release()
+        self.status="No selected boss in World Arena - retrying later"return false
     end
     return true
 end
@@ -2561,7 +2684,7 @@ function WorldBoss:_step(dt)
     self:window()
     if self.target and not self:valid(self.target)then
         if self.target.Parent==adapter.enemies and not adapter:enemyAlive(self.target)then
-            self.kills+=1 local entry=self:entryFor(self.target,true)
+            self.kills+=1 self.retired[self.target]=true local entry=self:entryFor(self.target,true)
             if entry then self.defeated[entry.key]=true end
         end
         self:release()app.movement:waitAfterEnemy(now)
@@ -2611,7 +2734,7 @@ function WorldBoss:availability()
     table.sort(names)
     if #names>0 then return "Spawned: "..table.concat(names,", ")end
     local open,left=self:window()
-    return open and "Boss round: Open | Checking selected islands"or "Boss: Next round in "..math.ceil(left).."s"
+    return open and "Boss round: Open | Checking World Arena"or "Boss: Next round in "..math.ceil(left).."s"
 end
 function WorldBoss:mount(tab)
     local section=tab:Section({Name="World Boss",Side="Right"})
@@ -2659,15 +2782,22 @@ local MODES={"All Monsters","Normal Only","Brutes Only"}
 
 function Storm.resolve(location,catalog)
     if type(location)~="string"and type(location)~="number"then return end
-    local key=tostring(location)
-    return catalog.byKey[key]or catalog.byMapId[key]or catalog.byName[key]
+    local key=tostring(location):match("^%s*(.-)%s*$")
+    if key==""then return end
+    local island=catalog.byKey[key]or catalog.byMapId[key]or catalog.byName[key]
+    if island then return island end
+    local numeric=tonumber(key)
+    if numeric and catalog.byMapId[tostring(numeric)]then return catalog.byMapId[tostring(numeric)]end
+    for name,value in pairs(catalog.byKey)do if name:lower()==key:lower()then return value end end
+    for name,value in pairs(catalog.byName)do if name:lower()==key:lower()then return value end end
 end
+
 function Storm.new(app)
     local self=setmetatable({app=app,adapter=app.adapter,alive=true,enabled=false,mode="All Monsters",
         visited={},nextSearch=0,kills=0,status="Stopped",connections={},eventName="Storm"},Storm)
     table.insert(self.connections,self.adapter.rs:GetAttributeChangedSignal("StormLocation"):Connect(function()
         if not self.alive then return end
-        self:release()self.island=nil self.visited={}
+        self:release()self.island=nil self.visited={}self.retryAt=0 self.emptySince=nil
     end))
     table.insert(self.connections,self.adapter.player.CharacterAdded:Connect(function()
         self:release()self.app.movement.corrections=0
@@ -2679,7 +2809,7 @@ function Storm:location()
     return Storm.resolve(raw,self.app.catalog),raw
 end
 function Storm:release()
-    self.target=nil self.nextSearch=0
+    self.target=nil self.nextSearch=0 self.emptySince=nil
     if self.owns then self.owns=false self.app:invalidate()end
 end
 function Storm:sync()
@@ -2691,12 +2821,12 @@ end
 function Storm:setMode(mode)
     local valid=false for _,value in ipairs(MODES)do if mode==value then valid=true break end end
     if not valid or mode==self.mode then return end
-    self:release()self.mode=mode self.island=nil self.visited={}
+    self:release()self.mode=mode self.island=nil self.visited={}self.retryAt=0
 end
 function Storm:setEnabled(value)
     value=value==true
     if value==self.enabled then self:sync()return end
-    self:release()self.enabled=value self.island=nil self.visited={}
+    self:release()self.enabled=value self.island=nil self.visited={}self.retryAt=0
     if value then
         if self.app.desert then self.app.desert:stop("Storm selected")end
         if self.app.castle then self.app.castle:stop("Storm selected")end
@@ -2724,11 +2854,15 @@ end
 function Storm:wantsWork()
     if not self.enabled or self.adapter:blocked()then return false end
     local island=self:location()
-    return island~=nil and self.adapter:character()~=nil
+    if not island or not self.adapter:character()then return false end
+    if island~=self.island then self.island=island self.visited={}self:buildTargets(island)self.retryAt=0 end
+    return next(self.ids or {})~=nil and os.clock()>=(self.retryAt or 0)
 end
+
 function Storm:move(character,root,humanoid,goal,look,key,dt,now)
     local app=self.app
     if not goal then self.status="Waiting for island position"return false end
+    self.adapter:requestArea(goal,"Storm:"..self.island.key,now)
     if app.shadowFollow then
         local ready,reason=app.shadowFollow:beforeMove(key,character,root,goal,now)
         if not ready then app.movement:stop()self.status=reason return false end
@@ -2749,7 +2883,7 @@ function Storm:_step(dt)
     local app,adapter=self.app,self.adapter
     local island,raw=self:location()
     if not island then
-        self:release()self.island=nil self.visited={}
+        self:release()self.island=nil self.visited={}self.retryAt=0 self.emptySince=nil
         self.status=(raw==nil or raw==false or raw=="")and "Waiting for Storm"or "Storm location is unavailable in this world"
         return false
     end
@@ -2760,8 +2894,8 @@ function Storm:_step(dt)
     if island~=self.island then
         self:release()self.island=island self.visited={}self:buildTargets(island)
     end
-    if next(self.ids)==nil then self:release()self.status="No matching monsters on "..island.name return false end
-    if not self.owns then app:invalidate()self.owns=true end
+    if next(self.ids)==nil then self.retryAt=os.clock()+10 self:release()self.status="No matching monsters on "..island.name return false end
+    if not self.owns then app:invalidate()self.owns=true self.emptySince=nil end
     local now=os.clock()
     if self.target and not self:valid(self.target)then
         if not adapter:enemyAlive(self.target)then
@@ -2785,13 +2919,20 @@ function Storm:_step(dt)
     end
     local target=self.target
     if not target then
+        self.emptySince=self.emptySince or now
+        if now-self.emptySince>=15 then
+            self.retryAt=now+10 self:release()
+            self.status="Storm targets unavailable - yielding and retrying"return false
+        end
         local spawn=adapter:spawnPosition(island,character,root,humanoid)
         if spawn and adapter.requestArea then adapter:requestArea(spawn,"Storm:"..island.key,now)end
         if spawn and(root.Position-spawn).Magnitude>120 then
             self:move(character,root,humanoid,spawn,spawn,"Storm:"..island.key,dt,now)
+        elseif not spawn then app.movement:stop()self.status="Waiting for Storm spawn coordinates | "..island.name
         else app.movement:stop()self.status="Waiting for Storm monsters | "..island.name end
         return true
     end
+    self.emptySince=nil
     local goal=adapter:targetPosition(target,character,root,humanoid,now)
     if not self:move(character,root,humanoid,goal,target.Position,target,dt,now)then return true end
     -- Check the current replicated location again immediately before sending a hit.
