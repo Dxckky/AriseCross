@@ -1,6 +1,6 @@
--- ARISE-2.1 | senzy hub | by prxwqay
--- อัปเดต -2.1:
--- Dedu -> Infernal handoff: preserve the existing world-event rotation while waiting.
+-- ARISE-2.2 | senzy hub | by prxwqay
+-- Checkpoint recovery: stream and approach the actual current Castle room; discard previous-floor targets.
+-- Preserves the supplied v2.1 Dedu/Infernal handoff and all other systems.
 local source=[=[
 local Catalog=(function()
 -- Pure catalog helpers. Island membership comes from its quest chain, not World alone.
@@ -1989,13 +1989,15 @@ function Dungeon:farmStep(character,root,humanoid,dt,now)
     local room=self.adapter.rs:GetAttribute("CurrentRoom")
     if room~=self.lastRoom then
         self.lastRoom=room
-        if not self.target then self.nextEnemy=0 self.app.movement:stop()end
+        self.target=nil self.nextEnemy=0 self.app.movement:stop()
     end
     if self.timeLeft and self.timeLeft<=0 then
         self.app.movement:stop()self.status="Waiting for the dungeon result"return true
     end
-    if self.target and not self.adapter:enemyAlive(self.target) then
-        self.target=nil self.nextEnemy=0 self.app.movement:stop()self.app.movement:waitAfterEnemy(now)
+    if self.target and not self:aliveEnemy(self.target) then
+        local died=not self.adapter:enemyAlive(self.target)
+        self.target=nil self.nextEnemy=0 self.app.movement:stop()
+        if died then self.app.movement:waitAfterEnemy(now)end
     end
     if not self.target and self.app.movement:waitingForEnemy(now)then
         self.app.movement:stop()self.status="Waiting after target death"return true
@@ -4584,6 +4586,52 @@ function Castle:joinStep(now)
     self.adapter.generalBridge:Fire({Event="CastleAction",Action="Join",Check=floor~=false,Floor=floor or nil})
     self.status="Entering Infernal Castle"return true
 end
+function Castle:floorAnchor(floor,root)
+    local main=workspace:FindFirstChild("__Main")
+    local world=main and main:FindFirstChild("__World")
+    if not world or not floor then return end
+    local room=world:FindFirstChild("Room_"..tostring(floor))
+    if not room then
+        for _,candidate in ipairs(world:GetChildren())do
+            if tonumber(candidate:GetAttribute("RoomID"))==floor then room=candidate break end
+        end
+    end
+    if not room then return end
+    local markers=room:FindFirstChild("PlayersSpawns")or room:FindFirstChild("EnemiesSpawn")
+    if markers then
+        if markers:IsA("BasePart")then return markers.Position end
+        for _,part in ipairs(markers:GetDescendants())do
+            if part:IsA("BasePart")then return part.Position end
+        end
+    end
+    if room:IsA("Model")then return room:GetPivot().Position end
+end
+function Castle:loadFloor(floor,dt,now)
+    local character,root,humanoid=self.adapter:character()
+    if not character then self.status="Waiting for character"return end
+    local anchor=self:floorAnchor(floor,root)
+    if not anchor then self.app.movement:stop()self.status="Floor "..tostring(floor).." | Waiting for room geometry"return end
+    if self.adapter.requestArea then self.adapter:requestArea(anchor,"CastleFloor:"..tostring(floor),now)end
+    self.status="Floor "..tostring(floor).." | Loading current room"
+    -- A checkpoint may update CurrentRoom while the player remains at Room_1's spawn.
+    -- Use only this room's real ground, never the player's old room or an airborne fallback.
+    local delta=root.Position-anchor
+    if Vector3.new(delta.X,0,delta.Z).Magnitude<=100 then self.app.movement:stop()return end
+    local blocked=self.adapter:blocked(true)
+    if blocked then self.app.movement:stop()self.status=blocked return end
+    local ground=self.adapter:groundAt(anchor,8,512)
+    if not ground then self.app.movement:stop()self.status="Floor "..tostring(floor).." | Waiting for current room ground"return end
+    local goal=ground+Vector3.new(0,self.adapter:standingHeight(character,root,humanoid),0)
+    local arrived,message=self.app.movement:step(character,root,humanoid,goal,anchor,"TP",self.app.speed,
+        "CastleCheckpoint:"..tostring(floor),dt,now)
+    if message then
+        self.status=message
+        if self.app.movement.corrections>=3 then self:stop(message)end
+        return
+    end
+    if arrived then self.adapter.nextEnemySnapshot=0
+    else self.status="Moving to Castle floor "..tostring(floor)end
+end
 function Castle:_step(dt,now)
     local inside=self:inside()
     if inside or not self.joinEnabled then self.waitingForDedu=nil end
@@ -4627,15 +4675,13 @@ function Castle:_step(dt,now)
     -- The server can announce a checkpoint before its geometry and enemy parts stream in.
     -- An empty client list must never mean that a floor with living enemies was cleared.
     if alive==0 and remaining and remaining>0 then
-        self.emptySince=nil self.loadingSince=self.loadingSince or now self.lastProgress=now
-        self:release()
-        local character,root=self.adapter:character()
-        if character and root and self.adapter.requestArea then
-            self.adapter:requestArea(root.Position,"CastleFloor:"..tostring(floor),now)
-        end
+        self.emptySince=nil self.loadingSince=self.loadingSince or now
+        -- Do not release every heartbeat: that cancels an in-progress checkpoint move.
+        self.combat.target=nil
+        if not self.combat.owns then self.combat:claim("farm")end
         if floor and floor>=self.stopFloor then self:nativeStep(now,false,true)
         else self:nativeStep(now,true)end
-        self.status="Floor "..tostring(floor or "?").." | Loading enemy data: "..remaining
+        self:loadFloor(floor,dt,now)
         return true
     end
     self.loadingSince=nil
