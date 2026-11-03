@@ -1,5 +1,5 @@
--- ARISE 1.0 | senzy hub | by prxwqay
--- v1.9: scheduled one-shot island check; stop immediately on confirmed Ant King death.
+-- ARISE-2.0 | senzy hub | by prxwqay
+-- อัปเดต -2.0:
 local source=[=[
 local Catalog=(function()
 -- Pure catalog helpers. Island membership comes from its quest chain, not World alone.
@@ -1162,8 +1162,8 @@ function Controller:modeStep(dt)
 end
 function Controller:eventStep(dt)
     local now=os.clock()
-    local workers,ready={},{ }
-    for _,name in ipairs({"raid","worldBoss","storm","pumpkins"})do
+    local workers,ready={},{}
+    for _,name in ipairs({"storm","raid","worldBoss","pumpkins"})do
         if self[name]then table.insert(workers,self[name])end
     end
     for _,worker in ipairs(workers)do
@@ -1175,11 +1175,14 @@ function Controller:eventStep(dt)
             else ready[worker]=value==true end
         end
     end
+    -- Weighted rotation: Storm is the base task, with a visit between each side event.
+    -- Readiness is checked every heartbeat, including Dedu's scheduled discovery/retries.
+    local rotation={"storm","raid","storm","worldBoss","pumpkins"}
+    local yielded
     local function release(owner)
         self.eventOwner=nil self.eventOwnerSince=nil
         if self.runtimeOwner==owner then self.runtimeOwner=nil end
         owner:release()
-        -- Each lease starts with an independent correction budget; warp pacing stays shared.
         self.movement.corrections=0
     end
     local owner=self.eventOwner
@@ -1190,23 +1193,35 @@ function Controller:eventStep(dt)
         local age=now-(self.eventOwnerSince or now)
         local fighting=owner.target and self.adapter:enemyAlive(owner.target)
         local looting=owner.corpses and next(owner.corpses)~=nil
-        if alternative and(age>=90 or age>=60 and not fighting and not looting)then
-            release(owner)owner=nil
+        local finalBoss=owner==self.raid and owner:holdsFinalBoss()
+        local soft,hard=45,60
+        if owner==self.storm then soft,hard=15,30 end
+        if alternative and not finalBoss and(age>=hard or age>=soft and not fighting and not looting)then
+            yielded=owner release(owner)owner=nil
         end
     end
-    -- A finished/unavailable worker can hand off in this same heartbeat.
+    -- A completed/empty visit hands off immediately; a yielded Storm cannot reclaim its duplicate slot.
     for _=1,#workers do
         if not owner then
             local start=self.eventCursor or 0
-            for offset=1,#workers do
-                local index=(start+offset-1)%#workers+1
-                if ready[workers[index]]then
-                    owner=workers[index]self.eventCursor=index
+            for offset=1,#rotation do
+                local index=(start+offset-1)%#rotation+1
+                local worker=self[rotation[index]]
+                if worker and worker~=yielded and ready[worker]then
+                    owner=worker self.eventCursor=index
                     self.eventOwner=owner self.eventOwnerSince=now break
                 end
             end
+            if not owner and yielded and ready[yielded]then
+                owner=yielded self.eventOwner=owner self.eventOwnerSince=now
+            end
         end
         if not owner then return false end
+        -- Coordinate event movement with instance entry and the ordinary farm as well.
+        if self.runtimeOwner~=owner then
+            self:acquireRuntime(owner)
+            self.eventOwner=owner self.eventOwnerSince=now
+        end
         self.currentWorker=owner
         local ok,handled=pcall(owner.step,owner,dt)
         self.currentWorker=nil
@@ -1219,6 +1234,7 @@ function Controller:eventStep(dt)
     end
     return false
 end
+
 
 function Controller:step(dt)
     if not self.alive then return end
@@ -2173,38 +2189,85 @@ end
 function Raid:serverNow()
     return tonumber(self.adapter.rs:GetAttribute("DateTime"))or workspace:GetServerTimeNow()
 end
-function Raid:state()
+function Raid:state(skipObservation)
     local open,left,cycle=Raid.window(self:serverNow(),self.adapter.balanceInfo.JejuIsland)
     if cycle~=self.windowCycle then
         self.windowCycle=cycle self.streamRequested=false self.stateNext=0
         self.emptySince=nil self.probeStarted=nil self.retryAt=0 self.clearedCycle=nil
         self.seenLiving=false self.returnCycle=nil self.returning=false self.active=false
-        self.arrivedAt=nil self.checkedEmptyCycle=nil self.discoveryStarted=nil
+        self.arrivedAt=nil self.discoveryStarted=nil self.queenDefeatedCycle=nil self.kingSeenCycle=nil
         self.target=nil self.nextScan=0 table.clear(self.corpses)table.clear(self.records)
         table.clear(self.retired)table.clear(self.availabilityRetired)
     end
     local count=self.loadedCount or 0
     local attackable=self.loadedAttackable or 0
-    if os.clock()>=(self.stateNext or 0)then
-        self.stateNext=os.clock()+.25 count=0 attackable=0
+    local now=os.clock()
+    if now>=(self.stateNext or 0)then
+        self.stateNext=now+.25 count=0 attackable=0
         for _,enemy in ipairs(self.adapter:enemyList())do
             if enemy.Parent==self.adapter.enemies and enemy:IsA("BasePart")and not self.availabilityRetired[enemy]then
                 local attrs=self.adapter:enemyAttributes(enemy)
-                if Raid.isRaidInfo(attrs)and attrs.Dead~=true and Catalog.healthKey(attrs.HP)then
-                    count+=1 if attrs.Shield~=true then attackable+=1 end
+                if Raid.isRaidInfo(attrs)then
+                    -- Observe while another event owns movement; preserve late-stage death evidence.
+                    if not skipObservation and open and self.finishedCycle~=cycle then self:observeEnemy(enemy,attrs,now)end
+                    if attrs.Dead~=true and Catalog.healthKey(attrs.HP)then
+                        count+=1 if attrs.Shield~=true then attackable+=1 end
+                    end
                 end
             end
         end
         self.loadedCount=count self.loadedAttackable=attackable
     end
     if count>0 and self.finishedCycle~=cycle then
-        self.discoveryStarted=nil
-        self.clearedCycle=nil self.emptySince=nil self.seenLiving=true
+        self.discoveryStarted=nil self.emptySince=nil self.seenLiving=true
         if attackable>0 then self.retryAt=0 end
     end
-    -- Stale streamed enemies cannot keep a closed round alive.
     return self.finishedCycle~=cycle and open,count,left,cycle
 end
+
+function Raid:observeEnemy(enemy,attrs,now)
+    if not Raid.isRaidInfo(attrs)then return end
+    local id=tostring(attrs.Id or attrs.ID)
+    local record=self.records[enemy.Name]
+    if not record or record.instance~=enemy or record.id~=id or record.cycle~=self.windowCycle then
+        record={id=id,instance=enemy,dead=false,cycle=self.windowCycle}
+        self.records[enemy.Name]=record
+    end
+    record.position=enemy.Position record.lastSeen=now
+    if attrs.Dead~=true and Catalog.healthKey(attrs.HP)then
+        record.seenAlive=true
+        if id=="JJ4"then self.kingSeenCycle=self.windowCycle end
+    elseif record.seenAlive then
+        local hp=tonumber(attrs.HP)
+        if attrs.Dead==true or hp and hp<=0 then
+            record.deathConfirmed=true
+            if id=="JJ3"then self.queenDefeatedCycle=self.windowCycle end
+        end
+    end
+    return record
+end
+
+function Raid:waitingStatus()
+    if self.queenDefeatedCycle==self.windowCycle or self.kingSeenCycle==self.windowCycle then
+        return "Dedu pending | Waiting for Ant King / rechecking island"
+    end
+    return "Dedu pending | Waiting for next wave / enemy data"
+end
+
+function Raid:endRound(cycle)
+    -- JejuFinish is an end/cleanup notification, not evidence that JJ4 died.
+    self.finishedCycle=cycle self.active=false self.returning=false self.target=nil
+    self.finishAt=os.clock() table.clear(self.corpses)
+    for _,enemy in ipairs(self.adapter:enemyList())do
+        if enemy:IsA("BasePart")and Raid.isRaidInfo(enemy:GetAttributes())then
+            self.retired[enemy]=true self.availabilityRetired[enemy]=true
+        end
+    end
+    self:release()
+    self.status=self.clearedCycle==cycle and "Dedu cleared | Ant King defeated"
+        or "Dedu ended | Ant King defeat not confirmed"
+end
+
 
 function Raid.isRaidInfo(info)
     return type(info)=="table" and ORDER[tostring(info.Id or info.ID)]~=nil
@@ -2221,15 +2284,9 @@ function Raid.new(app)
         connections={},nextScan=0,nextLoot=0,kills=0,rounds=0,captured=0,destroyed=0,eventName="Dedu Raid"},Raid)
     self.availabilityRetired={}
     table.insert(self.connections,self.adapter.bridge:Connect(function(message)
-        if self.alive and type(message)=="table" and message.Event=="JejuFinish" then
-            local _,_,cycle=Raid.window(self:serverNow(),self.adapter.balanceInfo.JejuIsland)
-            self.finishedCycle=cycle
-            self.raidStartedAt=nil
-            for _,enemy in ipairs(self.adapter:enemyList())do
-                if enemy:IsA("BasePart")and Raid.isRaidInfo(enemy:GetAttributes())then self.availabilityRetired[enemy]=true end
-            end
+        if self.alive and type(message)=="table"and(self.enabled or message.Event=="JejuFinish")then
+            self:onEvent(message)
         end
-        if self.alive and self.enabled and type(message)=="table" then self:onEvent(message)end
     end))
     table.insert(self.connections,self.adapter.player.CharacterAdded:Connect(function()
         self.target=nil self.nextScan=0 
@@ -2238,7 +2295,8 @@ function Raid.new(app)
     return self
 end
 function Raid:release()
-    self.emptySince=nil self.probeStarted=nil self.arrivedAt=nil
+    -- Drop only this movement visit; retain Queen/King progress until the server cycle changes.
+    self.emptySince=nil self.probeStarted=nil self.arrivedAt=nil self.discoveryStarted=nil
     if self.owns then self.app:invalidate()self.owns=false end
     self:restoreLootControl()
 end
@@ -2264,8 +2322,8 @@ function Raid:setEnabled(value)
     value=value==true
     if value==self.enabled then return end
     self:release()
-    self.enabled=value self.target=nil self.nextScan=0
-    table.clear(self.corpses)table.clear(self.records)table.clear(self.retired)
+    self.enabled=value self.target=nil self.nextScan=0 self.stateNext=0
+    table.clear(self.corpses)
     self.active=false self.returning=false self.finishAt=nil self.retryAt=0 self.probeStarted=nil self.emptySince=nil
     if value then
         local _,root=self.adapter:character()
@@ -2280,29 +2338,33 @@ function Raid:setEnabled(value)
 end
 function Raid:onEvent(message)
     local now=os.clock()
-    if message.Event=="JejuFinish" then
-        local _,_,cycle=Raid.window(self:serverNow(),self.adapter.balanceInfo.JejuIsland)
-        self.finishedCycle=cycle
-        local participated=self.active or self.owns
-        if self.active and self.countedCycle~=cycle then self.rounds+=1 self.countedCycle=cycle end
-        self.active=false self.target=nil self.finishAt=now
-        self.returning=false table.clear(self.corpses)
-        for _,enemy in ipairs(self.adapter:enemyList())do
-            if enemy:IsA("BasePart")and Raid.isRaidInfo(enemy:GetAttributes())then self.retired[enemy]=true end
-        end
-        if self.owns then self.app.movement:stop()end
+    local dedu=getmetatable(self)==Raid
+    if dedu then self:state(message.Event=="JejuFinish")end
+    if message.Event=="JejuFinish"then
+        if dedu then self:endRound(self.windowCycle)end
         return
     end
     local key=tostring(message.Enemy or message.EnemyId or "")
     local record=self.records[key]
+    if dedu then
+        local enemy=self.adapter.enemies:FindFirstChild(key)
+        if enemy and enemy:IsA("BasePart")and(self.finishedCycle~=self.windowCycle or message.Event=="EnemyDeath")then
+            record=self:observeEnemy(enemy,self.adapter:enemyAttributes(enemy),now)
+        end
+        if record and record.cycle~=self.windowCycle then record=nil end
+    end
     if message.Event=="RespawnEnemy"then
-        if record then record.dead=false self.retired[record.instance]=nil self.availabilityRetired[record.instance]=nil end
+        if record then
+            record.dead=false record.deathConfirmed=nil record.seenAlive=false
+            if self.retired then self.retired[record.instance]=nil end
+            if self.availabilityRetired then self.availabilityRetired[record.instance]=nil end
+        end
         self.stateNext=0 self.nextScan=0
-    elseif message.Event=="EnemyDeath" and record and not record.dead then
-        record.dead=true self.kills+=1
-        if record.id=="JJ4"and getmetatable(self)==Raid then
-            local _,_,cycle=Raid.window(self:serverNow(),self.adapter.balanceInfo.JejuIsland)
-            self:completeRound(cycle)return
+    elseif message.Event=="EnemyDeath"and record and not record.dead then
+        record.dead=true record.deathConfirmed=true self.kills+=1 self.stateNext=0
+        if dedu then
+            if record.id=="JJ3"then self.queenDefeatedCycle=self.windowCycle end
+            if record.id=="JJ4"then self:completeRound(self.windowCycle)return end
         end
     elseif message.Event=="EnemyArise" and message.CanArise==true and record and self.afterDefeat~="Ignore" then
         if getmetatable(self)==Raid then
@@ -2349,21 +2411,19 @@ function Raid:scan(root,now)
     for enemy in pairs(self.retired)do if not enemy.Parent then self.retired[enemy]=nil end end
     for _,enemy in ipairs(self.adapter:enemyList())do
         if enemy:IsA("BasePart")and Raid.isRaidInfo(enemy:GetAttributes())then
-            local id=tostring(enemy:GetAttribute("Id")or enemy:GetAttribute("ID"))
-            local record=self.records[enemy.Name]
-            if not record or record.instance~=enemy then
-                record={id=id,instance=enemy,position=enemy.Position,dead=false,lastSeen=now}
-                self.records[enemy.Name]=record
-            end
-            record.position=enemy.Position record.lastSeen=now
+            local record=self:observeEnemy(enemy,self.adapter:enemyAttributes(enemy),now)
+            local id=record.id
             if self:validEnemy(enemy) then
-                record.seenAlive=true
                 local s=Raid.priority(id,(root.Position-enemy.Position).Magnitude,self.priorityMode)
                 if s<score then best,score=enemy,s end
             end
         end
     end
-    for name,r in pairs(self.records)do if not r.instance.Parent and now-r.lastSeen>20 and not self.corpses[name]then self.records[name]=nil end end
+    for name,r in pairs(self.records)do
+        if r.id~="JJ3"and r.id~="JJ4"and not r.instance.Parent and now-r.lastSeen>20 and not self.corpses[name]then
+            self.records[name]=nil
+        end
+    end
     if self.target and not self:validEnemy(self.target)then
         if not self.adapter:enemyAlive(self.target)then self.app.movement:waitAfterEnemy(now)end
         self.target=nil
@@ -2441,18 +2501,16 @@ function Raid:_step(dt)
     if self:kingDefeated()then self:completeRound(cycle)return false end
     if not open then
         self.active=false self.target=nil self:release()
-        self.status="Waiting for Dedu Raid"return false
-    end
-    if self.checkedEmptyCycle==cycle or count==0 and next(self.corpses)==nil and self.seenLiving then
-        self.checkedEmptyCycle=cycle self.active=false self.target=nil self:release()
-        self.status="Dedu skipped | Waiting for next round"return false
+        self.status=self.clearedCycle==cycle and "Dedu cleared | Ant King defeated"
+            or "Dedu ended / closed | Ant King defeat not confirmed"
+        return false
     end
     if not self.owns then
         self.app:invalidate()self.owns=true self:takeLootControl()
         if self.returnCycle~=cycle then self.returnCycle=cycle self.returnPosition=root.Position end
         self.probeStarted=now
     end
-    -- An empty streamed snapshot is not an official finish. Settle locally, then yield.
+    -- Empty waves and the Queen-to-King gap remain pending; never mark this cycle skipped.
     if self.target and not self:validEnemy(self.target)then
         if not self.adapter:enemyAlive(self.target)then self.app.movement:waitAfterEnemy(now)end
         self.target=nil self.app.movement:stop()
@@ -2502,8 +2560,8 @@ function Raid:_step(dt)
         if not open then self.active=false self:release()return false end
         self.discoveryStarted=self.discoveryStarted or now
         if now-self.discoveryStarted>=30 then
-            self.checkedEmptyCycle=cycle self.active=false self:release()
-            self.status="Dedu verification ended | Waiting for next round"return false
+            self.retryAt=now+10 self:release()
+            self.status=self:waitingStatus()return false
         end
         local goal=self.adapter:spawnPosition({key="JejuEvent"},character,root,humanoid)
         if not goal then
@@ -2516,10 +2574,9 @@ function Raid:_step(dt)
             return true
         end
         self.arrivedAt=self.arrivedAt or now
-        self.status="Dedu open | Waiting for enemy data"
-        if now-self.arrivedAt>=3 then
-            self.checkedEmptyCycle=cycle self.active=false self:release()
-            self.status="No living Dedu enemies | Waiting for next round"
+        self.status=self:waitingStatus()
+        if now-self.arrivedAt>=8 then
+            self.retryAt=now+10 self:release()
             return false
         end
         return true
@@ -2532,23 +2589,37 @@ function Raid:_step(dt)
 end
 
 function Raid:kingDefeated()
-    -- A streamed-out model is not proof of death; require an observed living king and real death state.
+    -- Streaming out, a nil HP, a corpse first seen on arrival, and JejuFinish are not proof.
     for _,record in pairs(self.records)do
-        local enemy=record.instance
-        if record.id=="JJ4"and record.seenAlive and enemy and enemy.Parent==self.adapter.enemies then
-            local hp=tonumber(self.adapter:enemyHP(enemy))
-            if enemy:GetAttribute("Dead")==true or hp and hp<=0 then return true end
+        if record.id=="JJ4"and record.cycle==self.windowCycle then
+            if record.deathConfirmed then return true end
+            local enemy=record.instance
+            if record.seenAlive and enemy and enemy.Parent==self.adapter.enemies
+                and self.finishedCycle~=self.windowCycle then
+                local attrs=self.adapter:enemyAttributes(enemy)
+                local hp=tonumber(attrs.HP)
+                if attrs.Dead==true or hp and hp<=0 then
+                    record.deathConfirmed=true return true
+                end
+            end
         end
     end
     return false
 end
+function Raid:holdsFinalBoss()
+    local target=self.target
+    return target~=nil and tostring(target:GetAttribute("Id")or target:GetAttribute("ID"))=="JJ4"
+        and self:validEnemy(target)
+end
 function Raid:completeRound(cycle)
-    if self.countedCycle ~= cycle then self.rounds += 1 self.countedCycle = cycle end
-    self.finishedCycle, self.clearedCycle = cycle, cycle
-    self.active, self.returning, self.target = false, false, nil
+    if cycle~=self.windowCycle or not self:kingDefeated()then return false end
+    if self.countedCycle~=cycle then self.rounds+=1 self.countedCycle=cycle end
+    self.finishedCycle,self.clearedCycle=cycle,cycle
+    self.active,self.returning,self.target=false,false,nil
     table.clear(self.corpses)
-    self.status = "Dedu cleared - waiting for the next spawn round"
+    self.status="Dedu cleared | Ant King defeated - waiting for next round"
     self:release()
+    return true
 end
 function Raid:wantsWork()
     if not self.enabled or not WORLD1[game.PlaceId]or self.adapter:blocked()then return false end
@@ -2556,31 +2627,30 @@ function Raid:wantsWork()
     if r:GetAttribute("Dungeon")==true or r:GetAttribute("IsCastle")==true or r:GetAttribute("InInfinite")==true
         or r:GetAttribute("HLRaid")==true or not self.adapter:character()then return false end
     local now=os.clock()
-    if self.target and not self.adapter:enemyAlive(self.target) then self.stateNext = 0 end
+    if self.target and not self.adapter:enemyAlive(self.target)then self.stateNext=0 end
     local open,count,_,cycle=self:state()
     if self:kingDefeated()then self:completeRound(cycle)return false end
-    if not open then self.active=false self.target=nil return false end
-    -- A negative inspection is final for this round, even if stale/late objects stream in later.
-    if self.checkedEmptyCycle==cycle then
-        self.active=false self.target=nil self.status="Dedu skipped | Waiting for next round"return false
+    if not open then
+        self.active=false self.target=nil
+        self.status=self.clearedCycle==cycle and "Dedu cleared | Ant King defeated"
+            or "Dedu ended / closed | Ant King defeat not confirmed"
+        return false
     end
     for key,c in pairs(self.corpses)do
         if now>=c.expires or self.afterDefeat=="Ignore"or typeof(c.position)~="Vector3"then self.corpses[key]=nil end
     end
-    -- Pure observation while another task runs: never claim movement for a known-empty island.
-    if next(self.corpses)==nil then
-        if count==0 and(self.checkedEmptyCycle==cycle or self.seenLiving)then
-            self.checkedEmptyCycle=cycle self.active=false self.target=nil
-            self.status="No living Dedu enemies | Waiting for next round"return false
-        end
-        if count>0 and(self.loadedAttackable or 0)==0 then
-            self.status="Dedu enemies are shielded - waiting"return false
-        end
+    if next(self.corpses)~=nil then return true end
+    if count>0 and(self.loadedAttackable or 0)==0 then
+        self.status="Dedu enemies are shielded - waiting"return false
     end
-    if self.returning and now-(self.finishAt or now)>=8 then self.returning=false end
-    if (self.loadedAttackable or 0)==0 and now<(self.retryAt or 0)then return next(self.corpses)~=nil end
-    return open or self.active==true or self.returning==true or next(self.corpses)~=nil
+    if count==0 then
+        self.status=self:waitingStatus()
+        if now<(self.retryAt or 0)then return false end
+    end
+    -- Retry every open cycle until JJ4 dies or the event actually ends; no one-shot empty check.
+    return true
 end
+
 
 function Raid:step(dt)
     if not self.alive then return false end
@@ -2598,9 +2668,9 @@ function Raid:availability()
     if not WORLD1[game.PlaceId]or self.adapter.rs:GetAttribute("Dungeon")==true
         or self.adapter.rs:GetAttribute("IsCastle")==true or self.adapter.rs:GetAttribute("InInfinite")==true then return "Raid: Unavailable in this world" end
     local open,count,left,cycle=self:state()
-    if open and self.checkedEmptyCycle==cycle then return "Raid: Skipped | Waiting for next round"end
-    if open then return count>0 and "Raid: Active | Enemies: "..count or "Raid: Open | Enemies not loaded"end
-    if self.finishedCycle==cycle then return "Raid: Cleared | Waiting for next round"end
+    if self.clearedCycle==cycle then return "Raid: Cleared | Ant King defeated"end
+    if open then return count>0 and "Raid: Active | Enemies: "..count or self:waitingStatus()end
+    if self.finishedCycle==cycle then return "Raid: Ended | Ant King defeat not confirmed"end
     return "Raid: Closed | Opens in "..math.ceil(left).."s"
 end
 function Raid:mount(group)
@@ -6431,7 +6501,7 @@ function UI.mount(app)
         "https://raw.githubusercontent.com/SYMBIOSHUB/SYMBIOS-HUB/refs/heads/main/UI/Symbios-ui.lua"
     )))()
     local window = library:Window({
-        Title = "Duckky Pray", Subtitle = "หีควยแตด",
+        Title = "Duckky Pray -2.0", Subtitle = "หีควยแตด",
         Size = UDim2.fromOffset(740, 440), Keybind = Enum.KeyCode.RightControl,
     })
     app.window = window
@@ -6718,7 +6788,7 @@ local ok,err=pcall(function()
     app:start()
 end)
 if not ok then app:Destroy()error("senzy hub: "..tostring(err))end
-print("SENZY_FARM_READY",#catalog.islands,"islands","World",adapter.world,"auto config enabled","Misc Instance Click ready")
+print("SENZY_FARM_READY","ARISE-2.0",#catalog.islands,"islands","World",adapter.world,"auto config enabled","Misc Instance Click ready")
 ]=]
 getgenv().__SenzyAriseFarmSource=source
 local run,err=loadstring(source)
