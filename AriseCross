@@ -1,5 +1,6 @@
--- ARISE-2.0 | senzy hub | by prxwqay
--- อัปเดต -2.0:
+-- ARISE-2.1 | senzy hub | by prxwqay
+-- อัปเดต -2.1:
+-- Dedu -> Infernal handoff: preserve the existing world-event rotation while waiting.
 local source=[=[
 local Catalog=(function()
 -- Pure catalog helpers. Island membership comes from its quest chain, not World alone.
@@ -1163,6 +1164,15 @@ end
 function Controller:eventStep(dt)
     local now=os.clock()
     local workers,ready={},{}
+    local function handoffCastle()
+        local castle=self.castle
+        if castle and castle.alive~=false and castle.joinEnabled and castle.waitingForDedu then
+            -- Readiness/step can confirm JJ4's death in this same frame. Enter before
+            -- the rotation sends movement back to Storm or another world event.
+            return self:runMode(castle,dt)
+        end
+        return false
+    end
     for _,name in ipairs({"storm","raid","worldBoss","pumpkins"})do
         if self[name]then table.insert(workers,self[name])end
     end
@@ -1175,6 +1185,7 @@ function Controller:eventStep(dt)
             else ready[worker]=value==true end
         end
     end
+    if handoffCastle()then return true end
     -- Weighted rotation: Storm is the base task, with a visit between each side event.
     -- Readiness is checked every heartbeat, including Dedu's scheduled discovery/retries.
     local rotation={"storm","raid","storm","worldBoss","pumpkins"}
@@ -1231,6 +1242,7 @@ function Controller:eventStep(dt)
         end
         if ok and handled==true then return true end
         ready[owner]=false release(owner)owner=nil
+        if handoffCastle()then return true end
     end
     return false
 end
@@ -2610,6 +2622,16 @@ function Raid:holdsFinalBoss()
     local target=self.target
     return target~=nil and tostring(target:GetAttribute("Id")or target:GetAttribute("ID"))=="JJ4"
         and self:validEnemy(target)
+end
+function Raid:pendingForCastle()
+    if not self.alive or not self.enabled or not WORLD1[game.PlaceId]then return false end
+    self:state()
+    local open,_,cycle=Raid.window(self:serverNow(),self.adapter.balanceInfo.JejuIsland)
+    if self:kingDefeated()then self:completeRound(cycle)return false end
+    -- A shield, a streaming gap, or a discovery retry is not a completed raid.
+    -- JejuFinish alone is cleanup, not proof of a King kill. Keep the Castle
+    -- wait until JJ4 is confirmed defeated; a missed King must not skip ahead.
+    return open and self.clearedCycle~=cycle
 end
 function Raid:completeRound(cycle)
     if cycle~=self.windowCycle or not self:kingDefeated()then return false end
@@ -4437,6 +4459,7 @@ function Castle:setFlag(key,value)
 end
 function Castle:stop(reason)
     self.joinEnabled,self.farmEnabled,self.replayEnabled=false,false,false self.stage="waiting"
+    self.waitingForDedu=nil
     self.status=reason or "Stopped"self:release()self:sync()
     self.returnToPrivate=false self.privateAttempted=false self.privateWaitUntil=nil self.stoppedFloor=nil
 end
@@ -4520,6 +4543,7 @@ function Castle:finishAtStop(now,floor)
     return true
 end
 function Castle:joinStep(now)
+    self.waitingForDedu=nil
     local open,left=Castle.schedule(self:now())
     if not open then self.status="Closed | Opens in "..math.ceil(left).."s"return false end
     if self.blockedCycle==self:cycle()then self.status="Waiting for next round"return false end
@@ -4529,6 +4553,14 @@ function Castle:joinStep(now)
     if self.stage=="entering"then
         if now-(self.entryAt or now)>40 then self.blockedCycle=self:cycle()self.stage="waiting"self.status="Entry not confirmed - waiting for next round"end
         return true
+    end
+    if not self:completed()or self.replayEnabled then
+        local raid=self.app.raid
+        if raid and raid:pendingForCastle()then
+            self.waitingForDedu=true
+            self.status="Infernal open | Waiting for Dedu Ant King defeat before Castle"
+            return false
+        end
     end
     if self:completed()then
         if not self.replayEnabled then self.status="Completed | Waiting for next round"return false end
@@ -4554,6 +4586,7 @@ function Castle:joinStep(now)
 end
 function Castle:_step(dt,now)
     local inside=self:inside()
+    if inside or not self.joinEnabled then self.waitingForDedu=nil end
     if not inside then
         self:nativeStep(now,false)
         if self.wasInside then
