@@ -1,7 +1,137 @@
--- ARISE-2.2 | senzy hub | by prxwqay
+-- ARISE-2.2 | senzy hub | by prxwqay | Config Fix 1
+-- Preferences persist independently of runtime; unified account-scoped storage and verified recovery.
 -- Checkpoint recovery: stream and approach the actual current Castle room; discard previous-floor targets.
 -- Preserves the supplied v2.1 Dedu/Infernal handoff and all other systems.
 local source=[=[
+local Persistence=(function()
+-- One profile per account/experience. Runtime resume records live inside that profile.
+local Persistence={}
+local ROOT="SenzyAriseFarm"
+function Persistence.path(kind,player)
+    player=player or game:GetService("Players").LocalPlayer
+    assert(player,"Player is not ready for config storage")
+    return ROOT.."/"..kind.."-"..tostring(game.GameId).."-"..tostring(player.UserId)
+        ..(kind=="loader"and ".luau"or ".json")
+end
+function Persistence.valid(data,player)
+    return type(data)=="table"and data.version==1
+        and data.userId==player.UserId and data.gameId==game.GameId
+end
+function Persistence.revision(data)
+    local n=type(data)=="table"and tonumber(data.revision)or 0
+    return n and n==n and n>=0 and n<math.huge and math.floor(n)or 0
+end
+function Persistence.read(player)
+    if type(readfile)~="function"then return nil end
+    player=player or game:GetService("Players").LocalPlayer
+    local path=Persistence.path("config",player)
+    local best
+    for _,file in ipairs({path,path..".pending",path..".bak"})do
+        local ok,data=pcall(function()
+            return game:GetService("HttpService"):JSONDecode(readfile(file))
+        end)
+        if ok and Persistence.valid(data,player)
+            and(not best or Persistence.revision(data)>Persistence.revision(best))then best=data end
+    end
+    return best
+end
+function Persistence.ensureLoader(player)
+    local source=getgenv().__SenzyAriseFarmSource
+    if type(source)~="string"or source==""then return false,"Bundled source is unavailable"end
+    local ok,err=pcall(function()
+        assert(type(writefile)=="function"and type(readfile)=="function"
+            and type(makefolder)=="function"and type(isfolder)=="function","Executor has no file storage")
+        if not isfolder(ROOT)then makefolder(ROOT)end
+        local path=Persistence.path("loader",player)
+        local readOk,current=pcall(readfile,path)
+        if not readOk or current~=source then
+            writefile(path,source)
+            assert(readfile(path)==source,"Teleport loader verification failed")
+        end
+    end)
+    return ok,not ok and tostring(err)or nil
+end
+function Persistence.save(app)
+    -- Setters can run during restoration or while one user action changes several modes.
+    -- The enclosing config transaction commits once it has a complete state.
+    if app.destroying or app.restoringConfig or not app.config or not app.config.ready then return true end
+    return app.config:flush()
+end
+function Persistence.resumeCode(kind,player)
+    player=player or game:GetService("Players").LocalPlayer
+    local prefix=string.format("local kind,expectedGame,expectedUser,path,loader=%q,%d,%d,%q,%q\n",
+        kind,game.GameId,player.UserId,Persistence.path("config",player),Persistence.path("loader",player))
+    return prefix..[==[
+task.spawn(function()
+    if not game:IsLoaded()then game.Loaded:Wait()end
+    if game.GameId~=expectedGame then return end
+    local players=game:GetService("Players")
+    local deadline=os.clock()+60
+    while not players.LocalPlayer and os.clock()<deadline do task.wait(.1)end
+    local player=players.LocalPlayer
+    if not player or player.UserId~=expectedUser or type(readfile)~="function"then return end
+    local http=game:GetService("HttpService")
+    local profile,revision
+    for _,file in ipairs({path,path..".pending",path..".bak"})do
+        local ok,data=pcall(function()return http:JSONDecode(readfile(file))end)
+        if ok and type(data)=="table"and data.version==1
+            and data.userId==expectedUser and data.gameId==expectedGame then
+            local n=tonumber(data.revision)or 0
+            if n~=n or n<0 or n==math.huge then n=0 end
+            if not profile or n>revision then profile,revision=data,n end
+        end
+    end
+    if not profile then return end
+    local runtime=type(profile.runtime)=="table"and profile.runtime or {}
+    if runtime.resumeAllowed==false then return end
+    local function active(t)
+        return type(t)=="table"and(t.join==true or t.farm==true or t.replay==true)
+    end
+    local flag
+    if kind=="dungeon"then
+        local worlds=type(profile.worlds)=="table"and profile.worlds or {}
+        local world=type(worlds[tostring(profile.lastWorld)])=="table"and worlds[tostring(profile.lastWorld)]or {}
+        local saved=type(runtime.dungeon)=="table"and runtime.dungeon or world.dungeon
+        if not active(saved)then return end
+        flag="__SenzyDungeonResume"
+    elseif kind=="hunter"then
+        local saved=runtime.hunter
+        if type(saved)~="table"or saved.enabled~=true then return end
+        local age=os.time()-(tonumber(saved.started)or 0)
+        if age<0 or age>=1200 then return end
+        local rs=game:GetService("ReplicatedStorage")
+        local untilReady=os.clock()+30
+        while(game.PlaceId==128336380114944 or game.PlaceId==73588121595735)
+            and rs:GetAttribute("IsTest")==nil and os.clock()<untilReady do task.wait(.1)end
+        if saved.confirmed~=true and rs:GetAttribute("IsTest")~=true then return end
+        flag="__SenzyHunterResume"
+    elseif kind=="castle"then
+        local saved=type(runtime.castle)=="table"and runtime.castle or profile.castle
+        if not active(saved)and not(type(saved)=="table"and saved.native)then return end
+        flag="__SenzyCastleResume"
+    elseif kind=="desert"then
+        if not active(type(runtime.desert)=="table"and runtime.desert or profile.desert)then return end
+        flag="__SenzyDesertResume"
+    elseif kind=="halloween"then
+        local halloween=type(profile.halloween)=="table"and profile.halloween or {}
+        if not active(type(runtime.halloween)=="table"and runtime.halloween or halloween.raid)then return end
+        flag="__SenzyHalloweenResume"
+    else return end
+    local env=getgenv()
+    if env.__SenzyResumeBootJob==game.JobId then return end
+    local ok,source=pcall(readfile,loader)
+    if not ok or type(source)~="string"then warn("[senzy hub] Teleport loader is unavailable")return end
+    local run,err=loadstring(source)
+    if not run then warn("[senzy hub] Resume compile failed: "..tostring(err))return end
+    env[flag]=true
+    env.__SenzyAriseFarmSource=source
+    run()
+end)
+]==]
+end
+return Persistence
+end)()
+
 local Catalog=(function()
 -- Pure catalog helpers. Island membership comes from its quest chain, not World alone.
 local Catalog = {}
@@ -1391,7 +1521,8 @@ function Controller:start()
 end
 
 function Controller:Destroy()
-    if not self.alive then return end
+    if not self.alive or self.destroying then return end
+    self.destroying=true self.alive=false
     if self.config then self.config:Destroy()end
     if self.dash then self.dash:Destroy()end
     if self.pumpkins then self.pumpkins:Destroy()end
@@ -1431,9 +1562,6 @@ local Dungeon=(function()
 -- Difficulty reflects actual gate data: Normal versus Red, not invented Easy/Hard modes.
 local Dungeon = {}
 Dungeon.__index = Dungeon
-local ROOT = "SenzyAriseFarm"
-local SETTINGS = ROOT .. "/dungeon.json"
-local LOADER = ROOT .. "/loader.luau"
 local PLACES = {[87039211657390]=true,[75812907038499]=true,[131604490933694]=true,
     [128336380114944]=true,[80896993021375]=true,[88685840848627]=true,
     [112387026435138]=true,[73588121595735]=true}
@@ -1479,10 +1607,17 @@ function Dungeon.matches(info, filters)
     if filters.difficulty=="Red" and info.IsRedDungeon~=true then return false end
     return true
 end
-function Dungeon.readSettings()
-    if type(readfile)~="function" then return {} end
-    local ok,data=pcall(function() return game:GetService("HttpService"):JSONDecode(readfile(SETTINGS)) end)
-    return ok and type(data)=="table" and data.version==1 and data or {}
+
+function Dungeon.readSettings(profile)
+    if type(profile)~="table"then return {}end
+    local runtime=type(profile.runtime)=="table"and profile.runtime or {}
+    if type(runtime.dungeon)=="table"then return table.clone(runtime.dungeon)end
+    local worlds=type(profile.worlds)=="table"and profile.worlds or {}
+    local world=type(worlds[tostring(profile.lastWorld)])=="table"and worlds[tostring(profile.lastWorld)]or {}
+    local settings=type(world.dungeon)=="table"and table.clone(world.dungeon)or {}
+    settings.version=1 settings.world=profile.lastWorld settings.session=runtime.dungeonSession
+    settings.replayCurrency=settings.currency
+    return settings
 end
 local function queueFunction()
     if type(queue_on_teleport)=="function" then return queue_on_teleport end
@@ -1546,53 +1681,32 @@ function Dungeon:frame()
     local pg=self.adapter.player:FindFirstChild("PlayerGui")
     return pg and pg:FindFirstChild("Dungeon",true)
 end
+
 function Dungeon:save()
-    if type(writefile)~="function" or type(makefolder)~="function" or type(isfolder)~="function" then return false end
-    local ok,err=pcall(function()
-        if not isfolder(ROOT) then makefolder(ROOT)end
-        local data={version=1,island=self.filters.island,ranks=Dungeon.rankList(self.filters.ranks),
-            difficulty=self.filters.difficulty,join=self.joinEnabled,farm=self.farmEnabled,world=self.world,
-            replay=self.replayEnabled,replayCurrency=self.replayCurrency,session=self.session}
-        writefile(SETTINGS,self.adapter.rs and game:GetService("HttpService"):JSONEncode(data) or "{}")
-        local source=getgenv().__SenzyAriseFarmSource
-        if type(source)=="string" and #source>0 and not self.loaderWritten then
-            writefile(LOADER,source)
-            self.loaderWritten=true
-        end
-    end)
-    self.storageError=not ok and tostring(err) or nil
+    if self.app.destroying then return true end
+    if not self.loaderWritten then
+        local ok,err=Persistence.ensureLoader(self.adapter.player)
+        if not ok then self.storageError=err return false end
+        self.loaderWritten=true
+    end
+    local ok=Persistence.save(self.app)
+    self.storageError=not ok and(self.app.config and self.app.config.lastError or "Cannot save config")or nil
     return ok
 end
 function Dungeon:prepareResume()
     if not (self.joinEnabled or self.farmEnabled or self.replayEnabled) then return end
     if not self:save() then return end
     local env=getgenv()
-    if env.__SenzyAriseDungeonQueueV2 then return end
+    if env.__SenzyAriseDungeonQueueV3 then return end
     local queue=queueFunction()
     if not queue then self.resumeWarning="Re-run the script after teleport (executor has no queue support)"return end
-    if type(isfile)~="function" or not isfile(LOADER) then
+    if not self.loaderWritten then
         self.resumeWarning="Run the bundled script to enable teleport resume"
         return
     end
-    local code = [[
-task.spawn(function()
-    if not game:IsLoaded() then game.Loaded:Wait() end
-    local allowed = { [87039211657390]=true,[75812907038499]=true,[131604490933694]=true,
-        [128336380114944]=true,[80896993021375]=true,[88685840848627]=true,
-        [112387026435138]=true,[73588121595735]=true }
-    if not allowed[game.PlaceId] then return end
-    local ok,settings=pcall(function()return game:GetService("HttpService"):JSONDecode(readfile("SenzyAriseFarm/dungeon.json"))end)
-    if not ok or type(settings)~="table" or not(settings.join or settings.farm or settings.replay) then return end
-    getgenv().__SenzyDungeonResume=true
-    local source=readfile("SenzyAriseFarm/loader.luau")
-    getgenv().__SenzyAriseFarmSource=source
-    local run,err=loadstring(source)
-    if not run then warn("[senzy hub] Resume compile failed",err)return end
-    run()
-end)
-]]
+    local code=Persistence.resumeCode("dungeon",self.adapter.player)
     local ok,err=pcall(queue,code)
-    if ok then env.__SenzyAriseDungeonQueueV2=true self.resumeWarning=nil
+    if ok then env.__SenzyAriseDungeonQueueV3=true self.resumeWarning=nil
     else self.resumeWarning="Teleport resume unavailable: "..tostring(err)end
 end
 function Dungeon.gateDeadline(info,now,balance)
@@ -3597,15 +3711,13 @@ local HunterTest=(function()
 -- A requested Hunter Rank Test can resume from the destination's native IsTest flag.
 local HunterTest={}
 HunterTest.__index=HunterTest
-local SETTINGS="SenzyAriseFarm/hunter.json"
-local LOADER="SenzyAriseFarm/loader.luau"
 local INSTANCES={[128336380114944]=true,[73588121595735]=true}
 local WORLDS={[87039211657390]=true,[75812907038499]=true,[131604490933694]=true,
     [80896993021375]=true,[88685840848627]=true,[112387026435138]=true}
-function HunterTest.readSettings()
-    if type(readfile)~="function"then return {}end
-    local ok,data=pcall(function()return game:GetService("HttpService"):JSONDecode(readfile(SETTINGS))end)
-    return ok and type(data)=="table"and data.version==1 and data or {}
+
+function HunterTest.readSettings(profile)
+    local runtime=type(profile)=="table"and type(profile.runtime)=="table"and profile.runtime or {}
+    return type(runtime.hunter)=="table"and table.clone(runtime.hunter)or {}
 end
 function HunterTest.canStart(rank,maxRank,info,awaken,hasQuest)
     if type(rank)~="number"then return false,"Rank data unavailable"end
@@ -3674,14 +3786,9 @@ function HunterTest.new(app,saved,resume)
     if self.enabled then self:prepareResume()end
     return self
 end
+
 function HunterTest:save()
-    if type(writefile)~="function"or type(makefolder)~="function"or type(isfolder)~="function"then return false end
-    local ok=pcall(function()
-        if not isfolder("SenzyAriseFarm")then makefolder("SenzyAriseFarm")end
-        writefile(SETTINGS,game:GetService("HttpService"):JSONEncode({version=1,
-            enabled=self.enabled,confirmed=self.confirmed,rank=self.startRank,started=self.started,world=self.world,phase=self.stage}))
-    end)
-    return ok
+    return Persistence.save(self.app)
 end
 function HunterTest:prepareResume()
     if not self:save()then return false,"Cannot save Hunter Test settings"end
@@ -3689,33 +3796,11 @@ function HunterTest:prepareResume()
     local queue=type(queue_on_teleport)=="function"and queue_on_teleport
         or type(queueonteleport)=="function"and queueonteleport
     if not queue then return false,"Executor has no teleport resume support"end
-    if getgenv().__SenzyHunterQueued then return true end
-    local code=[[
- task.spawn(function()
-    if not game:IsLoaded()then game.Loaded:Wait()end
-    local allowed={[128336380114944]=true,[73588121595735]=true,[87039211657390]=true,
-        [75812907038499]=true,[131604490933694]=true,[80896993021375]=true,
-        [88685840848627]=true,[112387026435138]=true}
-    if not allowed[game.PlaceId]then return end
-    local ok,saved=pcall(function()return game:GetService("HttpService"):JSONDecode(readfile("SenzyAriseFarm/hunter.json"))end)
-    if not ok or type(saved)~="table"or not saved.enabled
-        or os.time()-(tonumber(saved.started)or 0)>1200 then return end
-    local rs=game:GetService("ReplicatedStorage")
-    local deadline=os.clock()+30
-    while (game.PlaceId==128336380114944 or game.PlaceId==73588121595735)
-        and rs:GetAttribute("IsTest")==nil and os.clock()<deadline do task.wait(.1)end
-    if not saved.confirmed and rs:GetAttribute("IsTest")~=true then return end
-    getgenv().__SenzyHunterResume=true
-    local source=readfile("SenzyAriseFarm/loader.luau")
-    getgenv().__SenzyAriseFarmSource=source
-    local run,err=loadstring(source)
-    if not run then warn("[senzy hub] Hunter resume failed",err)return end
-    run()
- end)
-]]
+    if getgenv().__SenzyHunterQueuedV3 then return true end
+    local code=Persistence.resumeCode("hunter",self.adapter.player)
     local ok,err=pcall(queue,code)
     if not ok then return false,tostring(err)end
-    getgenv().__SenzyHunterQueued=true
+    getgenv().__SenzyHunterQueuedV3=true
     return true
 end
 function HunterTest:requirements()
@@ -3944,7 +4029,6 @@ end)()
 local Companions=(function()
 local Companions={}
 Companions.__index=Companions
-local SETTINGS="SenzyAriseFarm/companions.json"
 function Companions.damageKey(value)
     if type(value)=="table"then
         local key=Catalog.healthKey(value.first)
@@ -3966,11 +4050,7 @@ function Companions.sameSet(list,current)
     return count==#list and next(wanted)==nil
 end
 function Companions.new(app,resume)
-    local saved={}
-    if type(readfile)=="function"then
-        local ok,data=pcall(function()return game:GetService("HttpService"):JSONDecode(readfile(SETTINGS))end)
-        if ok and type(data)=="table"and (data.version==1 or data.version==2) then saved=data end
-    end
+    local saved={} -- Config:restore applies account-scoped preferences after construction.
     local self=setmetatable({app=app,adapter=app.adapter,alive=true,
         autoEquip=resume and saved.autoEquip==true or false,autoSummon=resume and saved.autoSummon==true or false,
         connections={},nextEquipRequest=0,nextShow=0},Companions)
@@ -3979,11 +4059,11 @@ function Companions.new(app,resume)
         local nextEquip=0
         while self.alive and self.app.alive do
             local now=os.clock()
-            if self.autoSummon then
+            if self.autoSummon and not app.restoringConfig then
                 local ok,err=pcall(self.summon,self,now)
                 if not ok then self:setAutoSummon(false)warn("[senzy hub] Auto Summon Shadows stopped: "..tostring(err))end
             end
-            if self.autoEquip and now>=nextEquip then
+            if self.autoEquip and not app.restoringConfig and now>=nextEquip then
                 nextEquip=now+1
                 local ok,err=pcall(self.equipBest,self,now)
                 if not ok then self:setAutoEquip(false)warn("[senzy hub] Auto Equip Best stopped: "..tostring(err))end
@@ -3993,12 +4073,9 @@ function Companions.new(app,resume)
     end)
     return self
 end
+
 function Companions:save()
-    pcall(function()
-        if type(writefile)~="function"or type(makefolder)~="function"or type(isfolder)~="function"then return end
-        if not isfolder("SenzyAriseFarm")then makefolder("SenzyAriseFarm")end
-        writefile(SETTINGS,game:GetService("HttpService"):JSONEncode({version=2,autoEquip=self.autoEquip,autoSummon=self.autoSummon}))
-    end)
+    return Persistence.save(self.app)
 end
 function Companions:setAutoEquip(value)
     self.autoEquip=value==true self.nextEquipRequest=0 self:save()
@@ -4086,7 +4163,6 @@ local Server=(function()
 -- A URL link code is not treated as a reserved-server access code.
 local Server={}
 Server.__index=Server
-local SETTINGS="SenzyAriseFarm/server-link.json"
 function Server.normalize(value)
     if type(value)~="string"then return nil,"Paste a Roblox private server link"end
     local url=value:match("^%s*(.-)%s*$")
@@ -4121,24 +4197,19 @@ function Server.launchUrl(value)
     if place then return "roblox://placeId="..place.."&linkCode="..params.privateserverlinkcode,url end
     return "roblox://navigation/share_links?code="..params.code.."&type=Server",url
 end
-function Server.new(app)
-    local self=setmetatable({app=app,alive=true,link="",status="",nextOpen=0},Server)
-    if type(readfile)=="function"then
-        local ok,data=pcall(function()return game:GetService("HttpService"):JSONDecode(readfile(SETTINGS))end)
-        if ok and type(data)=="table"and data.version==1 then self.link=Server.normalize(data.link)or ""end
-    end
+
+function Server.new(app,profile)
+    local settings=type(profile)=="table"and type(profile.server)=="table"and profile.server or {}
+    local self=setmetatable({app=app,alive=true,link=Server.normalize(settings.link)or "",status="",nextOpen=0},Server)
     return self
 end
 function Server:setStatus(text)
     self.status=text
     if self.statusLabel then pcall(self.statusLabel.UpdateName,self.statusLabel,text)end
 end
+
 function Server:save()
-    pcall(function()
-        if type(writefile)~="function"or type(makefolder)~="function"or type(isfolder)~="function"then return end
-        if not isfolder("SenzyAriseFarm")then makefolder("SenzyAriseFarm")end
-        writefile(SETTINGS,game:GetService("HttpService"):JSONEncode({version=1,link=self.link}))
-    end)
+    return Persistence.save(self.app)
 end
 function Server:currentLink()
     if self.Controls and self.Controls.Link then
@@ -4469,21 +4540,9 @@ function Castle:prepareResume()
     if self.app.config then self.app.config:flush()end
     self.app.dungeon:save()
     local queue=queue_on_teleport or queueonteleport
-    if type(queue)~="function"or getgenv().__SenzyCastleQueue then return end
-    local path=self.app.config.path
-    local code=string.format([[
- task.spawn(function()
-    if not game:IsLoaded()then game.Loaded:Wait()end
-    if game.GameId~=%d then return end
-    local ok,p=pcall(function()return game:GetService("HttpService"):JSONDecode(readfile(%q))end)
-    if not ok or p.userId~=game:GetService("Players").LocalPlayer.UserId or not p.castle then return end
-    if not(p.castle.join or p.castle.farm or p.castle.native)then return end
-    getgenv().__SenzyCastleResume=true
-    local source=readfile("SenzyAriseFarm/loader.luau")getgenv().__SenzyAriseFarmSource=source
-    assert(loadstring(source))()
- end)
-]],game.GameId,path)
-    local ok=pcall(queue,code)if ok then getgenv().__SenzyCastleQueue=true end
+    if type(queue)~="function"or getgenv().__SenzyCastleQueueV3 then return end
+    local code=Persistence.resumeCode("castle",self.adapter.player)
+    local ok=pcall(queue,code)if ok then getgenv().__SenzyCastleQueueV3=true end
 end
 function Castle:nativeStep(now,active,hold)
     local settings=self.adapter:getSettings()if not settings then return false end
@@ -4872,20 +4931,9 @@ function Desert:prepareResume()
     if self.app.config then self.app.config:flush()end
     if self.app.dungeon then self.app.dungeon:save()end
     local env=getgenv()local queue=queue_on_teleport or queueonteleport
-    if type(queue)~="function"or env.__SenzyDesertQueue or not self.app.config then return end
-    local code=string.format([[
-task.spawn(function()
- if not game:IsLoaded()then game.Loaded:Wait()end
- if game.GameId~=%d then return end
- local ok,p=pcall(function()return game:GetService("HttpService"):JSONDecode(readfile(%q))end)
- if not ok or p.userId~=game:GetService("Players").LocalPlayer.UserId or not p.desert then return end
- if not(p.desert.join or p.desert.farm or p.desert.replay)then return end
- getgenv().__SenzyDesertResume=true
- local source=readfile("SenzyAriseFarm/loader.luau")getgenv().__SenzyAriseFarmSource=source
- assert(loadstring(source))()
-end)
-]],game.GameId,self.app.config.path)
-    local ok=pcall(queue,code)if ok then env.__SenzyDesertQueue=true end
+    if type(queue)~="function"or env.__SenzyDesertQueueV3 or not self.app.config then return end
+    local code=Persistence.resumeCode("desert",self.adapter.player)
+    local ok=pcall(queue,code)if ok then env.__SenzyDesertQueueV3=true end
 end
 function Desert:onEvent(m,now)
     if m.Event=="CreatedInstance"and self.pending and type(m.DungeonInfo)=="table"
@@ -6013,22 +6061,7 @@ local HalloweenRaid = (function()
         self.app.dungeon:save()
         local queue = queue_on_teleport or queueonteleport
         if type(queue) ~= "function" or self.queued then return end
-        local code = string.format([[
-task.spawn(function()
-    if not game:IsLoaded() then game.Loaded:Wait() end
-    if game.GameId ~= %d then return end
-    local ok, profile = pcall(function()
-        return game:GetService("HttpService"):JSONDecode(readfile(%q))
-    end)
-    local raid = ok and profile.halloween and profile.halloween.raid
-    if not raid or not (raid.join or raid.farm or raid.replay) then return end
-    if profile.userId ~= game:GetService("Players").LocalPlayer.UserId then return end
-    getgenv().__SenzyHalloweenResume = true
-    local source = readfile("SenzyAriseFarm/loader.luau")
-    getgenv().__SenzyAriseFarmSource = source
-    assert(loadstring(source))()
-end)
-]], game.GameId, config.path)
+        local code = Persistence.resumeCode("halloween", self.adapter.player)
         local ok = pcall(queue, code)
         self.queued = ok
     end
@@ -6250,17 +6283,9 @@ local function option(value,options,default)
     for _,v in ipairs(options)do if value==v then return value end end
     return default
 end
-function Config.path(player)
-    return ROOT.."/config-"..tostring(game.GameId).."-"..tostring(player.UserId)..".json"
-end
-function Config.read(player)
-    if type(readfile)~="function"then return end
-    local path=Config.path(player)
-    for _,file in ipairs({path,path..".bak"})do
-        local ok,data=pcall(function()return game:GetService("HttpService"):JSONDecode(readfile(file))end)
-        if ok and type(data)=="table"and data.version==1 and data.userId==player.UserId and data.gameId==game.GameId then return data end
-    end
-end
+
+function Config.path(player)return Persistence.path("config",player)end
+function Config.read(player)return Persistence.read(player)end
 function Config.capture(app,previous)
     local result=copy(previous or {})
     result.version=1 result.userId=app.adapter.player.UserId result.gameId=game.GameId
@@ -6306,40 +6331,306 @@ function Config.capture(app,previous)
     end
     result.server={link=type(link)=="string"and link:sub(1,2048)or ""}
     result.runtime={jobId=game.JobId,dungeonSession=d and copy(d.session),
-        hunter=h and {enabled=boolean(h.enabled),confirmed=boolean(h.confirmed),rank=h.startRank,
-            started=h.started,world=h.world,phase=h.stage}or nil}
+        dungeon=d and {version=1,island=d.filters.island,ranks=Dungeon.rankList(d.filters.ranks),
+            difficulty=d.filters.difficulty,join=boolean(d.joinEnabled),farm=boolean(d.farmEnabled),
+            replay=boolean(d.replayEnabled),replayCurrency=d.replayCurrency,world=d.world,session=copy(d.session)}or nil,
+        hunter=h and {version=1,enabled=boolean(h.enabled),confirmed=boolean(h.confirmed),rank=h.startRank,
+            started=h.started,world=h.world,phase=h.stage}or nil,
+        castle=copy(result.castle),desert=copy(result.desert),
+        halloween=copy(result.halloween and result.halloween.raid)}
     return result
 end
-function Config.new(app,profile,context)
-    return setmetatable({app=app,profile=profile,context=context or {},alive=true,ready=false,
-        path=Config.path(app.adapter.player),connections={},serial=0},Config)
-end
-function Config:flush()
-    if not self.alive or not self.ready or self.app.restoringConfig then return false end
-    local nextProfile=Config.capture(self.app,self.profile)
-    if self.lastSnapshot and equal(self.lastSnapshot,nextProfile)then return true end
-    local ok,err=pcall(function()
-        assert(type(writefile)=="function"and type(makefolder)=="function"and type(isfolder)=="function","Executor has no file storage")
-        if not isfolder(ROOT)then makefolder(ROOT)end
-        local encoded=game:GetService("HttpService"):JSONEncode(nextProfile)
-        -- Write the recoverable copy first; a partial primary write will not erase the last complete JSON.
-        writefile(self.path..".bak",encoded)writefile(self.path,encoded)
-    end)
-    if not ok then
-        if not self.warned then self.warned=true warn("[senzy hub] Auto config could not save: "..tostring(err))end
-        return false
+-- Preferences are changed by user transactions; polling only refreshes resume state.
+local VALUE_TABLES={monsters=true,bosses=true,ranks=true,rarities=true,names=true,islands=true}
+local function preferencesOf(value)
+    local result=copy(value or {})
+    result.runtime=nil result.revision=nil result.savedAt=nil result.persistence=nil
+    if type(result.castle)=="table"then
+        result.castle.native=nil result.castle.payment=nil result.castle.blockedCycle=nil
     end
-    self.profile=nextProfile self.lastSnapshot=copy(nextProfile)
+    if type(result.desert)=="table"then result.desert.payment=nil result.desert.world=nil end
+    local raid=type(result.halloween)=="table"and result.halloween.raid
+    if type(raid)=="table"then
+        raid.session=nil raid.rounds=nil raid.counted=nil raid.stage=nil raid.jobId=nil
+    end
+    return result
+end
+local function defaults(target,source)
+    for key,value in pairs(source)do
+        if target[key]==nil then target[key]=copy(value)
+        elseif type(target[key])=="table"and type(value)=="table"and not VALUE_TABLES[key]then
+            defaults(target[key],value)
+        end
+    end
+end
+local function changes(target,before,after,key)
+    if equal(before,after)then return target end
+    if type(before)~="table"or type(after)~="table"or VALUE_TABLES[key]then return copy(after)end
+    target=type(target)=="table"and target or {}
+    local keys={}for k in pairs(before)do keys[k]=true end for k in pairs(after)do keys[k]=true end
+    for k in pairs(keys)do target[k]=changes(target[k],before[k],after[k],k)end
+    return target
+end
+local function readPath(root,path,world)
+    for key in path:gmatch("[^.]+")do
+        if key=="$"then key=world end
+        if type(root)~="table"then return nil end
+        root=root[key]
+    end
+    return root
+end
+local function writePath(root,path,world,value)
+    local keys={}for key in path:gmatch("[^.]+")do table.insert(keys,key=="$"and world or key)end
+    for i=1,#keys-1 do
+        local key=keys[i]
+        if type(root[key])~="table"then root[key]={}end
+        root=root[key]
+    end
+    root[keys[#keys]]=copy(value)
+end
+-- Explicit controls also commit a deliberate off/empty value when runtime was already off.
+local BINDINGS={
+    SenzyAriseIsland={"worlds.$.farm.island","worlds.$.farm.monsters","worlds.$.farm.enabled"},
+    SenzyAriseMonster={"worlds.$.farm.monsters","worlds.$.farm.enabled"},
+    SenzyAriseEnabled={"worlds.$.farm.enabled"},
+    SenzyAutoSetSpawn={"worlds.$.farm.spawn"},
+    SenzyTPDelay={"worlds.$.farm.delay"},
+    SenzyDungeonIsland={"worlds.$.dungeon.island"},
+    SenzyDungeonRanks={"worlds.$.dungeon.ranks"},
+    SenzyDungeonDifficulty={"worlds.$.dungeon.difficulty"},
+    SenzyDungeonJoin={"worlds.$.dungeon.join"},
+    SenzyDungeonFarm={"worlds.$.dungeon.farm"},
+    SenzyDungeonReplay={"worlds.$.dungeon.replay"},
+    SenzyDungeonReplayPayment={"worlds.$.dungeon.currency"},
+    SenzyDeduFarm={"worlds.$.raid.enabled"},
+    SenzyDeduReturn={"worlds.$.raid.returnAfter"},
+    SenzyDeduPriority={"worlds.$.raid.priority"},
+    SenzyDeduLoot={"worlds.$.raid.loot"},
+    SenzyWorldBossSelect={"worlds.$.worldBoss.bosses","worlds.$.worldBoss.enabled"},
+    SenzyWorldBossFarm={"worlds.$.worldBoss.enabled"},
+    SenzyStormTargets={"worlds.$.storm.mode"},
+    SenzyAutoStorm={"worlds.$.storm.enabled"},
+    SenzyMountHunt={"worlds.$.mounts.enabled"},
+    SenzyMountFilter={"worlds.$.mounts.mount"},
+    SenzyMountRarity={"worlds.$.mounts.rarity"},
+    SenzyAutoHunterTest={"hunter.enabled"},
+    SenzyAutoEquipBest={"helpers.equip"},
+    SenzyAutoSummonShadows={"helpers.summon"},
+    SenzyPrivateServerLink={"server.link"},
+    SenzyInstantArise={"defeat.mode"},
+    SenzyInstantDestroy={"defeat.mode"},
+    SenzyCastleJoin={"castle.join"},
+    SenzyCastleFarm={"castle.farm"},
+    SenzyCastleReplay={"castle.replay"},
+    SenzyCastleStart={"castle.start"},
+    SenzyCastleStop={"castle.limit"},
+    SenzyCastleLeaveAtStop={"castle.leave"},
+    SenzyCastleSpeed={"castle.speed"},
+    SenzyCastleCurrency={"castle.currency"},
+    SenzyDesertJoin={"desert.join"},
+    SenzyDesertFarm={"desert.farm"},
+    SenzyDesertReplay={"desert.replay"},
+    SenzyDesertStart={"desert.start"},
+    SenzyDesertStop={"desert.limit"},
+    SenzyDesertLeave={"desert.leave"},
+    SenzyDesertSpeed={"desert.speed"},
+    SenzyDesertPriority={"desert.priority"},
+    SenzyAutoSpinWheel={"misc.spin"},
+    SenzySellMode={"sell.mode"},
+    SenzySellRanks={"sell.ranks"},
+    SenzySellRarities={"sell.rarities"},
+    SenzySellNames={"sell.names"},
+    SenzySellBelow={"sell.below"},
+    SenzySellKeep={"sell.keep"},
+    SenzySellSpecial={"sell.special"},
+    SenzySellEnchanted={"sell.enchanted"},
+    SenzySellEnabled={"sell.enabled"},
+    SenzyAutoDash={"misc.dash.enabled"},
+    SenzyDashNoCD={"misc.dash.noCooldown"},
+    SenzyDashInterval={"misc.dash.interval"},
+    SenzyPumpkinIslands={"halloween.pumpkins.islands"},
+    SenzyPumpkinRoute={"halloween.pumpkins.route"},
+    SenzyPumpkins={"halloween.pumpkins.enabled"},
+    SenzyHalloweenJoin={"halloween.raid.join"},
+    SenzyHalloweenFarm={"halloween.raid.farm"},
+    SenzyHalloweenReplay={"halloween.raid.replay"},
+    SenzyHalloweenCurrency={"halloween.raid.currency"},
+    SenzyHalloweenLoot={"halloween.raid.loot"},
+    SenzyHalloweenLimit={"halloween.raid.limit"},
+    SenzyHalloweenLeave={"halloween.raid.leave"},
+    SenzyInstanceClick={"misc.click"},
+    SenzyFastAttackInterval={"misc.attackInterval"},
+}
+local MODE_FLAGS={
+    farm={"worlds.$.farm.enabled","worlds.$.farm.spawn"},
+    dungeon={"worlds.$.dungeon.join","worlds.$.dungeon.farm","worlds.$.dungeon.replay"},
+    dungeonTravel={"worlds.$.dungeon.join","worlds.$.dungeon.farm"},
+    mounts={"worlds.$.mounts.enabled"},hunter={"hunter.enabled"},
+    castle={"castle.join","castle.farm","castle.replay"},
+    desert={"desert.join","desert.farm","desert.replay"},
+}
+local MODE_EFFECTS={
+    SenzyAriseEnabled={"desert","castle","hunter","mounts"},
+    SenzyAutoSetSpawn={"desert","hunter","mounts","dungeonTravel"},
+    SenzyDungeonJoin={"desert","castle","hunter","mounts"},
+    SenzyDungeonFarm={"desert","castle","hunter","mounts"},
+    SenzyDungeonReplay={"desert","hunter","mounts"},
+    SenzyMountHunt={"desert","castle","hunter","farm","dungeonTravel"},
+    SenzyAutoHunterTest={"desert","castle","farm","mounts","dungeon"},
+    SenzyCastleJoin={"desert","hunter","mounts","farm","dungeon"},
+    SenzyCastleFarm={"desert","hunter","mounts","farm","dungeon"},
+    SenzyDesertJoin={"castle","hunter","mounts","farm","dungeon"},
+    SenzyDesertFarm={"castle","hunter","mounts","farm","dungeon"},
+    SenzyDesertReplay={"castle","hunter","mounts","farm","dungeon"},
+}
+function Config.new(app,profile,context)
+    return setmetatable({app=app,profile=profile,preferences=preferencesOf(profile),context=context or {},
+        alive=true,ready=false,path=Config.path(app.adapter.player),connections={},serial=0,uiDepth=0},Config)
+end
+function Config:snapshot()
+    local live=Config.capture(self.app,{})
+    local result=copy(self.preferences)
+    defaults(result,preferencesOf(live))
+    result.version=1 result.persistence=2 result.userId=live.userId result.gameId=live.gameId
+    result.lastWorld=live.lastWorld
+    result.runtime=copy(live.runtime)
+    result.runtime.resumeAllowed=not self.closing or self.teleporting==true
+    if live.castle then
+        result.castle.native=copy(live.castle.native)
+        result.castle.payment=copy(live.castle.payment)
+        result.castle.blockedCycle=live.castle.blockedCycle
+    end
+    if live.desert then result.desert.payment=copy(live.desert.payment)result.desert.world=live.desert.world end
+    if live.halloween and live.halloween.raid then
+        for _,key in ipairs({"session","rounds","counted","stage","jobId"})do
+            result.halloween.raid[key]=copy(live.halloween.raid[key])
+        end
+    end
+    result.revision=Persistence.revision(self.profile)
+    result.savedAt=type(self.profile)=="table"and self.profile.savedAt or nil
+    return result
+end
+function Config:warnSaveError(err)
+    self.lastError=tostring(err)
+    local now=os.clock()
+    if not self.lastWarning or now-self.lastWarning>=5 then
+        self.lastWarning=now
+        warn("[senzy hub] Auto config could not save; will retry: "..self.lastError)
+    end
+end
+function Config:flush(force)
+    if not self.alive or not self.ready or self.app.restoringConfig then return false end
+    if self.uiDepth>0 then self.pendingFlush=true return true end
+    if not force and self.nextSave and os.clock()<self.nextSave then return true end
+    if self.busy then
+        self.pendingFlush=true
+        if not force or self.writer==coroutine.running()then return true end
+        local deadline=os.clock()+3
+        while self.busy and os.clock()<deadline do task.wait(.01)end
+        if self.busy then self:warnSaveError("Timed out waiting for the active config writer")return false end
+        if not self.alive then return false end
+    end
+    self.busy=true self.writer=coroutine.running()
+    local ok,err=pcall(function()
+        repeat
+            self.pendingFlush=false
+            local nextProfile=self:snapshot()
+            if not self.lastSnapshot or not equal(self.lastSnapshot,nextProfile)then
+                assert(type(writefile)=="function"and type(readfile)=="function"
+                    and type(makefolder)=="function"and type(isfolder)=="function","Executor has no file storage")
+                if not isfolder(ROOT)then makefolder(ROOT)end
+                local player=self.app.adapter.player
+                nextProfile.revision=math.max(Persistence.revision(self.profile),
+                    Persistence.revision(Persistence.read(player)))+1
+                nextProfile.savedAt=os.time()
+                local http=game:GetService("HttpService")
+                local encoded=http:JSONEncode(nextProfile)
+                local oldOk,oldText=pcall(readfile,self.path)
+                local validOld=false
+                if oldOk then
+                    local decoded,old=pcall(http.JSONDecode,http,oldText)
+                    validOld=decoded and Persistence.valid(old,player)
+                end
+                -- A verified pending generation recovers even if the primary write is interrupted.
+                writefile(self.path..".pending",encoded)
+                assert(readfile(self.path..".pending")==encoded,"Pending config verification failed")
+                if validOld and oldText~=encoded then
+                    writefile(self.path..".bak",oldText)
+                    assert(readfile(self.path..".bak")==oldText,"Backup config verification failed")
+                end
+                writefile(self.path,encoded)
+                assert(readfile(self.path)==encoded,"Primary config verification failed")
+                self.profile=nextProfile self.lastSnapshot=copy(nextProfile)
+            end
+        until not self.pendingFlush
+    end)
+    self.busy=false self.writer=nil
+    if not ok then self:warnSaveError(err)return false end
+    self.lastError=nil self.lastWarning=nil
     return true
 end
 function Config:changed(immediate)
-    if not self.alive or not self.ready or self.app.restoringConfig then return end
+    if not self.alive or not self.ready or self.app.restoringConfig or self.app.destroying then return end
+    self.serial=self.serial+1
+    local serial=self.serial
+    if immediate then self.nextSave=nil else self.nextSave=os.clock()+.35 end
     if immediate then self:flush()return end
-    self.serial+=1 local serial=self.serial
-    task.delay(.2,function()if self.alive and self.serial==serial then self:flush()end end)
+    task.delay(.35,function()
+        if self.alive and self.serial==serial then self:flush()end
+    end)
 end
--- Keep native widgets and model setters from triggering gameplay while preferences are being restored.
+function Config:commitUserChange(before,flag,kind)
+    local after=preferencesOf(Config.capture(self.app,{}))
+    self.preferences=changes(self.preferences,preferencesOf(before),after)
+    local world=tostring(self.app.adapter.world)
+    for _,path in ipairs(BINDINGS[flag]or {})do
+        writePath(self.preferences,path,world,readPath(after,path,world))
+    end
+    local binding=BINDINGS[flag]
+    if kind=="Toggle"and binding and readPath(after,binding[1],world)==true then
+        for _,group in ipairs(MODE_EFFECTS[flag]or {})do
+            for _,path in ipairs(MODE_FLAGS[group])do
+                writePath(self.preferences,path,world,readPath(after,path,world))
+            end
+        end
+    end
+    self:changed(kind=="Toggle"or kind=="Dropdown"or kind=="Button")
+end
+
+-- Track programmatic widget updates so their synchronous or deferred callbacks are not user edits.
 function Config.guardGroup(app,native)
+    local function widgetValue(record,fallback)
+        local control,kind=record.control,record.kind
+        local getter=kind=="Toggle"and "GetState"or kind=="Dropdown"and "GetOptions"
+            or kind=="Input"and "GetInput"or kind=="Slider"and "GetValue"
+        if control and getter and type(control[getter])=="function"then
+            local ok,value=pcall(control[getter],control)
+            if ok then return copy(value),true end
+        end
+        if fallback~=nil then return copy(fallback),true end
+        return nil,false
+    end
+    local mutations={UpdateState=true,UpdateSelection=true,UpdateValue=true,UpdateText=true,
+        ClearOptions=true,InsertOptions=true}
+    local function widgetProxy(record)
+        return setmetatable({},{__index=function(_,key)
+            local method=record.control[key]
+            if type(method)~="function"then return method end
+            return function(_,...)
+                if not mutations[key]then return method(record.control,...)end
+                local args=table.pack(...)
+                record.programmatic=record.programmatic+1
+                local result=table.pack(pcall(method,record.control,table.unpack(args,1,args.n)))
+                local fallback=(key=="UpdateState"or key=="UpdateValue"or key=="UpdateText")and args[1]or nil
+                if key=="UpdateState"then fallback=args[1]end
+                local value,known=widgetValue(record,fallback)
+                if known then record.value=value record.known=true end
+                record.programmatic=record.programmatic-1
+                if not result[1]then error(result[2],0)end
+                return table.unpack(result,2,result.n)
+            end
+        end,__newindex=function(_,key,value)record.control[key]=value end})
+    end
     local function proxy(object,kind)
         return setmetatable({},{__index=function(_,key)
             local method=object[key]
@@ -6351,13 +6642,38 @@ function Config.guardGroup(app,native)
                 return function(_,settings,...)
                     local config=table.clone(settings)
                     local callback=config.Callback
+                    local extra=table.pack(...)
+                    local flag=extra[1]
+                    local record={kind=key,programmatic=0,value=copy(settings.Default),known=settings.Default~=nil}
                     if type(callback)=="function"then config.Callback=function(...)
-                        if not app.alive or app.restoringConfig then return end
-                        local values=table.pack(callback(...))
-                        if app.config then app.config:changed(key=="Toggle"or key=="Dropdown")end
-                        return table.unpack(values,1,values.n)
+                        if not app.alive or app.destroying or app.restoringConfig or record.programmatic>0 then return end
+                        local args=table.pack(...)
+                        local value,known=widgetValue(record,args[1])
+                        if key=="Toggle"and known and type(args[1])=="boolean"and args[1]~=value then return end
+                        if key~="Button"and known and record.known and equal(record.value,value)then return end
+                        if known then record.value=value record.known=true end
+                        local owner=app.config
+                        local before
+                        if owner and owner.ready then
+                            local ok,result=pcall(Config.capture,app,{})
+                            if ok then before=result else owner:warnSaveError(result)end
+                            owner.uiDepth=owner.uiDepth+1
+                        end
+                        local result=table.pack(pcall(callback,table.unpack(args,1,args.n)))
+                        if owner and owner.ready then
+                            owner.uiDepth=math.max(0,owner.uiDepth-1)
+                            if before and result[1]then
+                                local ok,err=pcall(owner.commitUserChange,owner,before,flag,key)
+                                if not ok then owner:warnSaveError(err)end
+                            end
+                        end
+                        if not result[1]then error(result[2],0)end
+                        return table.unpack(result,2,result.n)
                     end end
-                    return method(object,config,...)
+                    record.control=method(object,config,table.unpack(extra,1,extra.n))
+                    local value,known=widgetValue(record,settings.Default)
+                    if known then record.value=value record.known=true end
+                    return widgetProxy(record)
                 end
             end
             return function(_,...)return method(object,...)end
@@ -6510,7 +6826,12 @@ function Config:restore()
             local ds=app.desert local dc=type(saved.desert)=="table"and saved.desert or {}
             ds.startChoice=type(dc.start)=="string"and dc.start or "Wave 1"
             local validCheckpoint=ds:checkpoint()~=nil
-            if not validCheckpoint then ds.startChoice="Wave 1"end
+            if not validCheckpoint then
+                ds.startChoice="Wave 1"
+                validCheckpoint=ds:checkpoint()~=nil
+                self.preferences.desert=type(self.preferences.desert)=="table"and self.preferences.desert or {}
+                self.preferences.desert.start=ds.startChoice
+            end
             local _,_,maximum=ds:maximum()
             ds.stopWave=math.floor(number(dc.limit,maximum,1,maximum))ds.leaveAtStop=dc.leave~=false
             local _,speedOptions=ds.adapter:desertSpeedCatalog()
@@ -6549,18 +6870,32 @@ function Config:restore()
     app.restoringConfig=false
     if not ok then error("Auto config restore failed: "..tostring(err))end
 end
+
 function Config:start()
-    table.insert(self.connections,self.app.adapter.player.OnTeleport:Connect(function()self:flush()end))
-    self:restore()self.ready=true self:flush()
+    table.insert(self.connections,self.app.adapter.player.OnTeleport:Connect(function(state)
+        local name=state and state.Name
+        if name=="Started"or name=="WaitingForServer"or name=="InProgress"then self.teleporting=true
+        elseif name=="Failed"then self.teleporting=false end
+        self:flush(true)
+    end))
+    self:restore()
+    defaults(self.preferences,preferencesOf(Config.capture(self.app,{})))
+    self.ready=true self:flush(true)
     if self.app.desert and self.app.desert:active()then self.app.desert:prepareResume()end
     if self.app.halloweenRaid and self.app.halloweenRaid:active()then self.app.halloweenRaid:prepareResume()end
     task.spawn(function()
-        while self.alive and self.app.alive do self:flush()task.wait(.25)end
+        while self.alive and self.app.alive do
+            local ok,err=pcall(self.flush,self)
+            if not ok then self:warnSaveError(err)end
+            task.wait(.5)
+        end
     end)
 end
 function Config:Destroy()
     if not self.alive then return end
-    self:flush()self.alive=false
+    self.closing=true
+    self:flush(true)
+    self.alive=false self.serial=self.serial+1
     for _,c in ipairs(self.connections)do pcall(function()c:Disconnect()end)end
     table.clear(self.connections)
 end
@@ -6771,10 +7106,15 @@ local profile=Config.read(player)
 local old=env.SenzyAriseFarm
 if old and old.alive then
     if old.config then old.config:flush()end
-    profile=Config.capture(old,old.config and old.config.profile or profile)
+    if old.config and type(old.config.snapshot)=="function"then
+        local captured,value=pcall(old.config.snapshot,old.config)
+        if captured then profile=value end
+    else
+        profile=Config.capture(old,old.config and old.config.profile or profile)
+    end
 end
-local hunterSaved=HunterTest.readSettings()
-local saved=Dungeon.readSettings()
+local hunterSaved=HunterTest.readSettings(profile)
+local saved=Dungeon.readSettings(profile)
 local rs=game:GetService("ReplicatedStorage")
 local inInstance=game.PlaceId==128336380114944 or game.PlaceId==73588121595735
 local dungeonRestore=resume
@@ -6839,6 +7179,7 @@ end
 local adapter=Adapter.new()
 local catalog=Catalog.build(adapter.mapInfo,adapter.enemyInfo,adapter.questsInfo,adapter.world)
 local app=Controller.new(adapter,catalog,Catalog,Movement.new(adapter))
+app.restoringConfig=true
 adapter:installDispatch(app)
 app.shadowFollow=ShadowFollow.new(app)
 env.SenzyAriseFarm=app
@@ -6851,7 +7192,7 @@ local ok,err=pcall(function()
     app.mountHunt=MountHunt.new(app)
     app.hunterTest=HunterTest.new(app,hunterSaved,hunterRestore)
     app.companions=Companions.new(app,false)
-    app.server=Server.new(app)
+    app.server=Server.new(app,profile)
     app.defeat=Defeat.new(app)
     app.castle=Castle.new(app,profile and profile.castle)
     app.desert=Desert.new(app,profile and profile.desert)
@@ -6867,7 +7208,7 @@ local ok,err=pcall(function()
     app:start()
 end)
 if not ok then app:Destroy()error("senzy hub: "..tostring(err))end
-print("SENZY_FARM_READY","ARISE-2.0",#catalog.islands,"islands","World",adapter.world,"auto config enabled","Misc Instance Click ready")
+print("SENZY_FARM_READY","ARISE-2.2-config-fix",#catalog.islands,"islands","World",adapter.world,"auto config enabled","Misc Instance Click ready")
 ]=]
 getgenv().__SenzyAriseFarmSource=source
 local run,err=loadstring(source)
